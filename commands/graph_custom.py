@@ -1,19 +1,20 @@
 """Custom graph builder that reuses the main graph building logic."""
 
 import json
+import random
 import sys
 from pathlib import Path
-from typing import Optional
+
+from rich.console import Console
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from analysis.graph_builder import GraphBuilder
-import random
-from llm.client import LLMClient
 from pydantic import BaseModel, Field
-from typing import List as ListType
-from commands.graph import load_config
+
+from analysis.graph_builder import GraphBuilder
+from llm.client import LLMClient
+from utils.config_loader import load_config
 
 
 class CustomGraphSpec(BaseModel):
@@ -22,14 +23,14 @@ class CustomGraphSpec(BaseModel):
     name: str = Field(description="Graph name")
     focus: str = Field(description="What this graph focuses on")
     node_selection: str = Field(description="Criteria for selecting nodes")
-    edge_types: ListType[str] = Field(description="Types of edges to include")
+    edge_types: list[str] = Field(description="Types of edges to include")
 
 
 def build_custom_graph(
     project_path: Path,
     description: str,
-    name: Optional[str],
-    config_path: Optional[Path] = None,
+    name: str | None,
+    config_path: Path | None = None,
     iterations: int = 1,
     debug: bool = False
 ) -> Path:
@@ -38,60 +39,29 @@ def build_custom_graph(
     # Load config using the same function as graph build
     config = load_config(config_path)
     
-    # First, load some code samples to understand the codebase
+    # Load cards and manifest using GraphBuilder's method
     manifest_dir = project_path / "manifest"
-    if not manifest_dir.exists():
-        raise ValueError(f"No manifest found at {manifest_dir}. Run 'graph build' first.")
+    cards, manifest = GraphBuilder.load_cards_from_manifest(manifest_dir)
     
-    # Load manifest and ALL cards to understand the codebase
-    import json as json_lib
-    with open(manifest_dir / "manifest.json") as f:
-        manifest = json_lib.load(f)
-    
-    cards = []
-    with open(manifest_dir / "cards.jsonl") as f:
-        for line in f:
-            cards.append(json_lib.loads(line))
-    
-    # Calculate total size
-    total_size = sum(
-        len(card.get("content", "")) + 
-        len(card.get("peek_head", "")) + 
-        len(card.get("peek_tail", ""))
-        for card in cards
-    )
-    
-    # Use same adaptive sampling logic as main builder
-    original_count = len(cards)
+    # Create builder and use its methods for sampling and context preparation
     builder = GraphBuilder(config, debug=False)
-    cards = builder._sample_cards(cards, target_size_mb=2.0)
     
-    sampled_size = sum(
-        len(card.get("content", "")) + 
-        len(card.get("peek_head", "")) + 
-        len(card.get("peek_tail", ""))
-        for card in cards
-    )
+    # Sample cards using the builder's method
+    sampled_cards, original_count, sampled_count = builder.sample_cards_for_prompt(cards)
     
-    if len(cards) == original_count:  # If no sampling occurred
-        console.print(f"[dim]Using all {len(cards)} cards ({sampled_size:,} chars) for schema design[/dim]")
+    if sampled_count == original_count:
+        console.print(f"[dim]Using all {sampled_count} cards for schema design[/dim]")
     else:
-        console.print(f"[dim]Sampled {len(cards)} from {original_count} cards ({sampled_size:,} chars) for schema design[/dim]")
+        console.print(f"[dim]Sampled {sampled_count} from {original_count} cards for schema design[/dim]")
+    
+    # Prepare code context using builder's method
+    code_context = builder.prepare_code_context(sampled_cards)
     
     # Design the graph specification using agent model WITH CODE CONTEXT
     llm_agent = LLMClient(config, profile='agent')
     
     system_prompt = """Design a graph specification for the user's request BASED ON THE ACTUAL CODE.
     Analyze the code samples to understand what this codebase does, then design a graph that makes sense for THIS specific system."""
-    
-    # Prepare code context
-    code_context = []
-    for card in cards:
-        code_context.append({
-            "file": card.get("relpath", "unknown"),
-            "type": card.get("type", "unknown"),
-            "content": card.get("content", "")  # Use full content like main builder
-        })
     
     user_prompt = f"""
     User wants a graph for: {description}
@@ -101,7 +71,7 @@ def build_custom_graph(
     Files: {manifest.get('num_files', 0)}
     
     Code samples from the repository:
-    {json_lib.dumps(code_context, indent=2)}
+    {json.dumps(code_context, indent=2)}
     
     Based on THIS SPECIFIC CODE, create a specification that defines:
     1. A meaningful, descriptive name for this graph (e.g., "MonetaryFlows", "AuthorizationModel", "DataPipeline")
@@ -156,14 +126,12 @@ def build_custom_graph(
         )
     
     # Now use the main graph builder with this forced specification
-    manifest_dir = project_path / "manifest"
+    # manifest_dir already loaded above
     graphs_dir = project_path / "graphs"
     
-    if not manifest_dir.exists():
-        raise ValueError(f"No manifest found at {manifest_dir}. Run 'graph build' first.")
-    
-    # Create the graph builder
-    builder = GraphBuilder(config, debug=debug)
+    # builder already created above, but recreate with debug flag if needed
+    if debug and not builder.debug:
+        builder = GraphBuilder(config, debug=debug)
     
     # Build with forced graph specification that includes the full user description
     # Make sure the graph name doesn't get truncated
@@ -197,7 +165,7 @@ def build_custom_graph(
     
     if graph_path.exists():
         # Load and show summary
-        with open(graph_path, 'r') as f:
+        with open(graph_path) as f:
             graph_data = json.load(f)
         
         stats = graph_data.get('stats', {})
@@ -207,5 +175,4 @@ def build_custom_graph(
         console.print(f"  Iterations: {iterations}")
     
     return graph_path
-from rich.console import Console
 console = Console()

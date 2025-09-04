@@ -5,9 +5,12 @@ No fuzzy parsing, no prescriptive flow, just autonomous decision-making.
 
 import json
 import traceback
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
+
 from pydantic import BaseModel, Field
+
 try:
     # Pydantic v2 style config
     from pydantic import ConfigDict  # type: ignore
@@ -20,26 +23,26 @@ from .concurrent_knowledge import GraphStore
 class AgentParameters(BaseModel):
     """Strict parameters schema for agent actions (no extra keys)."""
     # load_graph
-    graph_name: Optional[str] = None
+    graph_name: str | None = None
     # load_nodes
-    node_ids: Optional[List[str]] = None
+    node_ids: list[str] | None = None
     # update_node
-    node_id: Optional[str] = None
-    observations: Optional[List[str]] = None
-    assumptions: Optional[List[str]] = None
+    node_id: str | None = None
+    observations: list[str] | None = None
+    assumptions: list[str] | None = None
     # form_hypothesis
-    description: Optional[str] = None
-    details: Optional[str] = None  # Added to support Gemini's response format
-    vulnerability_type: Optional[str] = None
-    confidence: Optional[float] = None
-    severity: Optional[str] = None
-    reasoning: Optional[str] = None
+    description: str | None = None
+    details: str | None = None  # Added to support Gemini's response format
+    vulnerability_type: str | None = None
+    confidence: float | None = None
+    severity: str | None = None
+    reasoning: str | None = None
     # update_hypothesis
-    hypothesis_index: Optional[int] = None
-    hypothesis_id: Optional[str] = None
-    new_confidence: Optional[float] = None
-    evidence: Optional[str] = None
-    evidence_type: Optional[str] = None
+    hypothesis_index: int | None = None
+    hypothesis_id: str | None = None
+    new_confidence: float | None = None
+    evidence: str | None = None
+    evidence_type: str | None = None
 
     # Ensure OpenAI JSON schema has additionalProperties: false
     if ConfigDict is not None:  # Pydantic v2
@@ -53,7 +56,7 @@ class AgentDecision(BaseModel):
     """Structured decision from the agent."""
     action: str = Field(..., description="Action to take: load_graph, load_nodes, update_node, form_hypothesis, update_hypothesis, complete")
     reasoning: str = Field(..., description="Reasoning for this action")
-    parameters: Dict[str, Any] = Field(default_factory=dict, description="Action-specific parameters as shown in examples")
+    parameters: dict[str, Any] = Field(default_factory=dict, description="Action-specific parameters as shown in examples")
     
     # Pydantic v2 config for strict validation
     if ConfigDict is not None:  # Pydantic v2
@@ -72,9 +75,9 @@ class AutonomousAgent:
                  graphs_metadata_path: Path,
                  manifest_path: Path,
                  agent_id: str,
-                 config: Optional[Dict] = None,
+                 config: dict | None = None,
                  debug: bool = False,
-                 session_id: Optional[str] = None):
+                 session_id: str | None = None):
         """Initialize the autonomous agent."""
         
         self.agent_id = agent_id
@@ -95,7 +98,7 @@ class AutonomousAgent:
         
         # Use provided config or load defaults
         if config is None:
-            from commands.graph import load_config
+            from utils.config_loader import load_config
             config = load_config()
         
         # Save config for later utilities
@@ -141,6 +144,11 @@ class AutonomousAgent:
         # Store in the project directory for persistence
         from .concurrent_knowledge import HypothesisStore
         project_dir = graphs_metadata_path.parent.parent  # Go up to project root from graphs/
+        # Keep a reference for features like steering inbox, etc.
+        try:
+            self.project_dir: Path = Path(project_dir)
+        except Exception:
+            self.project_dir = Path.cwd()
         hypothesis_path = project_dir / "hypotheses.json"
         self.hypothesis_store = HypothesisStore(hypothesis_path, agent_id=agent_id)
         
@@ -153,10 +161,10 @@ class AutonomousAgent:
             'graphs': {},      # Additional loaded graphs by name
         }
         # Lazy card index
-        self._card_index: Optional[Dict[str, Dict[str, Any]]] = None
-        self._file_to_cards: Dict[str, List[str]] = {}
+        self._card_index: dict[str, dict[str, Any]] | None = None
+        self._file_to_cards: dict[str, list[str]] = {}
         # Repo root to reconstruct card slices when needed
-        self._repo_root: Optional[Path] = None
+        self._repo_root: Path | None = None
         try:
             with open(self.manifest_path / 'manifest.json') as _mf:
                 _manifest = json.load(_mf)
@@ -175,14 +183,52 @@ class AutonomousAgent:
         # Conversation history for context
         self.conversation_history = []
         # Compressed memory notes
-        self.memory_notes: List[str] = []
+        self.memory_notes: list[str] = []
         # High-level action log
-        self.action_log: List[Dict[str, Any]] = []
+        self.action_log: list[dict[str, Any]] = []
         
         # Current investigation goal
         self.investigation_goal = ""
+
+        # Steering cache (last seen lines to avoid duplication in memory notes)
+        self._steering_seen: set[str] = set()
+
+        # Abort flag (set by runner on steering replan)
+        self._abort_requested: bool = False
+        self._abort_reason: str | None = None
+
+    def request_abort(self, reason: str | None = None):
+        """Signal the agent loop to abort the current investigation ASAP.
+        The runner uses this when a global steering request should preempt.
+        """
+        self._abort_requested = True
+        self._abort_reason = (reason or "steering_replan").strip() or "steering_replan"
+
+    def _read_steering_notes(self, limit: int = 12) -> list[str]:
+        """Read recent steering notes from project .hound/steering.jsonl (if any)."""
+        try:
+            sfile = self.project_dir / '.hound' / 'steering.jsonl'
+            if not sfile.exists():
+                return []
+            lines = []
+            with sfile.open('r', encoding='utf-8', errors='ignore') as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        obj = json.loads(ln)
+                        txt = obj.get('text') or obj.get('message') or obj.get('note')
+                        if txt:
+                            lines.append(str(txt).strip())
+                    except Exception:
+                        # fallback to raw line when not JSON
+                        lines.append(ln)
+            return lines[-limit:]
+        except Exception:
+            return []
     
-    def _load_graphs_metadata(self, metadata_path: Path) -> Dict:
+    def _load_graphs_metadata(self, metadata_path: Path) -> dict:
         """Load metadata about available graphs."""
         if not metadata_path.exists():
             return {}
@@ -313,8 +359,8 @@ class AutonomousAgent:
         except Exception as e:
             print(f"[!] Failed to refresh graphs: {e}")
     
-    def investigate(self, prompt: str, max_iterations: int = 20, 
-                   progress_callback: Optional[callable] = None) -> Dict:
+    def investigate(self, prompt: str, max_iterations: int = 20,
+                   progress_callback: Callable[[dict], None] | None = None) -> dict:
         """
         Main investigation method - agent works autonomously until complete.
         """
@@ -328,6 +374,19 @@ class AutonomousAgent:
         while iterations < max_iterations:
             iterations += 1
             
+            # Honor external abort signals early in the iteration
+            if getattr(self, '_abort_requested', False):
+                if progress_callback:
+                    try:
+                        progress_callback({
+                            'status': 'complete',
+                            'iteration': iterations,
+                            'message': f"Aborted due to: {getattr(self, '_abort_reason', 'steering_replan')}"
+                        })
+                    except Exception:
+                        pass
+                break
+
             if progress_callback:
                 progress_callback({
                     'status': 'analyzing',
@@ -428,6 +487,19 @@ class AutonomousAgent:
                             'message': 'Investigation complete'
                         })
                     break
+
+                # Honor external abort signals after executing an action too
+                if getattr(self, '_abort_requested', False):
+                    if progress_callback:
+                        try:
+                            progress_callback({
+                                'status': 'complete',
+                                'iteration': iterations,
+                                'message': f"Aborted due to: {getattr(self, '_abort_reason', 'steering_replan')}"
+                            })
+                        except Exception:
+                            pass
+                    break
                 
                 # Update progress based on action
                 if decision.action == 'form_hypothesis' and result.get('status') == 'success':
@@ -466,7 +538,7 @@ class AutonomousAgent:
         
         return self._generate_report(iterations)
     
-    def _format_graph_for_display(self, graph_data: Dict, graph_name: str) -> List[str]:
+    def _format_graph_for_display(self, graph_data: dict, graph_name: str) -> list[str]:
         """Format a graph for compact display with observations/assumptions."""
         lines = []
         lines.append(f"\n--- Graph: {graph_name} ---")
@@ -604,9 +676,30 @@ class AutonomousAgent:
         context_parts = []
         
         # Investigation goal
-        context_parts.append(f"=== INVESTIGATION GOAL ===")
+        context_parts.append("=== INVESTIGATION GOAL ===")
         context_parts.append(self.investigation_goal)
         context_parts.append("")
+
+        # User steering notes (if any)
+        steering = self._read_steering_notes(limit=12)
+        if steering:
+            context_parts.append("=== USER STEERING (HONOR THESE) ===")
+            for s in steering:
+                # Add to memory notes lightly if marked as remember/note
+                low = s.lower()
+                if any(k in low for k in ("remember", "note:", "keep in mind")):
+                    try:
+                        if s not in self._steering_seen:
+                            # Keep latest up to 5 steering memos
+                            self.memory_notes.append(f"[STEER] {s[:160]}")
+                            self._steering_seen.add(s)
+                            # Bound memory notes size
+                            if len(self.memory_notes) > 20:
+                                self.memory_notes = self.memory_notes[-20:]
+                    except Exception:
+                        pass
+                context_parts.append(f"• {s}")
+            context_parts.append("")
         
         # Available graphs (show all)
         context_parts.append("=== AVAILABLE GRAPHS ===")
@@ -711,7 +804,7 @@ class AutonomousAgent:
         try:
             from llm.tokenization import count_tokens
             return count_tokens(text, self.llm.provider_name, self.llm.model)
-        except Exception as e:
+        except Exception:
             try:
                 return max(1, len(text) // 4)
             except Exception:
@@ -859,9 +952,9 @@ class AutonomousAgent:
                     resp = self.summarizer.raw(system=sys_p, user=user_p)
                     
                     if resp:
-                        lines = [l.strip('-• ') for l in resp.splitlines() if l.strip()]
+                        lines = [ln.strip('-• ') for ln in resp.splitlines() if ln.strip()]
                         if lines:
-                            summary_note = f"[AI-Compressed history] " + ' | '.join(lines[:8])
+                            summary_note = "[AI-Compressed history] " + ' | '.join(lines[:8])
             except Exception:
                 pass  # Keep the heuristic summary
         
@@ -919,6 +1012,12 @@ YOUR CORE RESPONSIBILITY: You are the EXPLORER and CONTEXT BUILDER. Your primary
 The deep think model (guidance) is a separate, expensive reasoning engine that performs vulnerability analysis.
 It can ONLY analyze the context you prepare - if you don't load it, it can't analyze it!
 
+SEPARATION OF ROLES (IMPORTANT):
+- Scout (you) gathers code and facts; annotate graphs with short observations/assumptions.
+- NEVER speculate about vulnerabilities and do NOT adjudicate them yourself.
+- Prefer deep_think for vulnerability analysis; use form_hypothesis only if you must capture a lead and cannot escalate yet.
+- After assembling a coherent slice of code for the current investigation, CALL deep_think. Do not call deep_think based on hunches; call it when relevant code for the investigation is collected. The Strategist will analyze your prepared context and can surface additional vulnerabilities beyond the current goal if supported by evidence in the context.
+
 Your task is to investigate the system and identify potential vulnerabilities. The system architecture graph is automatically loaded and visible. You can see all available graphs and which are loaded.
 
 OPERATING CONSTRAINTS (IMPORTANT):
@@ -932,6 +1031,12 @@ CRITICAL RULES FOR NODE AND GRAPH NAMES:
 - NEVER add prefixes like "func_" or "node_" unless they're already there
 - If a node doesn't exist in the graph, DON'T try variations - it doesn't exist!
 - Check the graph FIRST to see what nodes actually exist before requesting them
+
+USER STEERING (PRIORITY):
+- If a "USER STEERING" section appears in Current Context, you MUST honor it immediately.
+- If instructed to "investigate/check X next", prioritize loading relevant graphs/nodes for X as your next action.
+- If asked to "remember/keep in mind" a constraint, treat it as a memory constraint in your reasoning.
+- Do NOT ignore steering unless it is impossible under constraints.
 
 IMPORTANT DISTINCTION:
 - Graph observations/assumptions: Facts about HOW the system works (invariants, behaviors, constraints)
@@ -968,6 +1073,12 @@ AVAILABLE ACTIONS - USE EXACT PARAMETERS AS SHOWN:
    
    The node IDs are shown in square brackets. Size indicators show code volume.
 
+AFTER LOADING CODE (WHEN CLEAR SIGNALS EXIST):
+- Add 1-3 ultra-short annotations via update_node for the most relevant loaded node(s).
+- Observations: concrete behaviors found in code (e.g., "external call", "emits Event", "nonReentrant", "unchecked", "token transfer").
+- Assumptions: invariants/constraints (e.g., "onlyOwner", "onlyRole(Role)", "pausable", "initializer", "immutable var").
+- Keep each bullet 2-4 words. Do not write prose. Skip if truly nothing notable.
+
 3. update_node — Add observations/assumptions about ONE node
    PARAMETERS: {"node_id": "node", "observations": [...], "assumptions": [...]}
    EXAMPLE: {"node_id": "ProxyAdmin", "observations": ["single admin", "no timelock"]}
@@ -985,7 +1096,10 @@ AVAILABLE ACTIONS - USE EXACT PARAMETERS AS SHOWN:
    PARAMETERS: {}
    EXAMPLE: {}
    Send empty object {} - NO PARAMETERS!
-   
+   WHEN TO CALL:
+   - After you have loaded enough specific code (functions/files) to represent the investigation focus.
+   - Do NOT call because you "suspect" issues; call when the relevant code for the investigation has been collected.
+   The Strategist will return ANY vulnerabilities detected from the prepared context (not limited to the goal) and will filter out weak/false positives.
    CRITICAL PREREQUISITES - DO NOT CALL deep_think UNTIL:
    - You have loaded RELEVANT graphs for the investigation topic
    - You have loaded ACTUAL CODE (nodes) that implements the feature being investigated
@@ -1146,7 +1260,7 @@ DO NOT include any text before or after the JSON object."""
                     parameters={}
                 )
     
-    def _execute_action(self, decision: AgentDecision) -> Dict:
+    def _execute_action(self, decision: AgentDecision) -> dict:
         """Execute the agent's decision."""
         action = decision.action
         params = decision.parameters  # Now a dict
@@ -1186,8 +1300,10 @@ DO NOT include any text before or after the JSON object."""
             return {'status': 'complete', 'summary': 'Investigation complete'}
         else:
             return {'status': 'error', 'error': f'Unknown action: {action}'}
+
     
-    def _load_graph(self, graph_name: str) -> Dict:
+    
+    def _load_graph(self, graph_name: str) -> dict:
         """Load an additional knowledge graph.
         
         The graph data is returned in the action response (appearing in history)
@@ -1263,8 +1379,7 @@ DO NOT include any text before or after the JSON object."""
             yield graph_name, self.loaded_data['system_graph']['data']
         
         # Additional loaded graphs
-        for name, data in self.loaded_data.get('graphs', {}).items():
-            yield name, data
+        yield from self.loaded_data.get('graphs', {}).items()
     
     def _ensure_card_index(self):
         """Load and cache cards.jsonl as an index by ID."""
@@ -1275,14 +1390,14 @@ DO NOT include any text before or after the JSON object."""
         self._card_index = idx
         self._file_to_cards.update(file_map)
 
-    def _extract_card_content(self, card: Dict[str, Any]) -> str:
+    def _extract_card_content(self, card: dict[str, Any]) -> str:
         """Get best-available content from a card record."""
         from .cards import extract_card_content
         return extract_card_content(card, self._repo_root)
 
     # Note: _iter_graphs was a duplicate of _iterate_graphs and has been removed.
 
-    def _load_nodes(self, node_ids: List[str], graph_name: Optional[str] = None) -> Dict:
+    def _load_nodes(self, node_ids: list[str], graph_name: str | None = None) -> dict:
         """Load complete node data with associated source code.
         
         Node details and code are returned in the action response (appearing in history)
@@ -1329,7 +1444,7 @@ DO NOT include any text before or after the JSON object."""
             }
         
         # Build index for ONLY the specified graph
-        node_by_id: Dict[str, Dict[str, Any]] = {}
+        node_by_id: dict[str, dict[str, Any]] = {}
         graph_edges = graph_data.get('edges', [])
         
         for n in graph_data.get('nodes', []):
@@ -1337,7 +1452,7 @@ DO NOT include any text before or after the JSON object."""
             if nid:
                 node_by_id[nid] = n
 
-        not_found: List[str] = []
+        not_found: list[str] = []
         loaded_nodes = []
 
         for req_id in node_ids:
@@ -1351,12 +1466,12 @@ DO NOT include any text before or after the JSON object."""
             chosen_id = req_id
             
             # Track large nodes for warning in display, but don't print here
-            source_refs = ndata.get('source_refs', []) or []
+            ndata.get('source_refs', []) or []
             # Will show warning in display_lines instead of printing
 
             # Collect evidence cards from node and its incident edges
             # We already have graph_edges from the specified graph
-            card_ids: List[str] = []
+            card_ids: list[str] = []
             node_refs = ndata.get('source_refs', []) or ndata.get('refs', []) or []
             if isinstance(node_refs, list):
                 card_ids.extend([str(x) for x in node_refs])
@@ -1379,7 +1494,7 @@ DO NOT include any text before or after the JSON object."""
                     base_ids.append(cid)
 
             # Resolve cards ordered by relpath + char_start
-            node_cards: List[Dict[str, Any]] = []
+            node_cards: list[dict[str, Any]] = []
             ordered = []
             for cid in base_ids:
                 c = self._card_index.get(cid)
@@ -1543,7 +1658,7 @@ DO NOT include any text before or after the JSON object."""
         }
     
     
-    def _save_graph_updates(self, graph_name: str, graph_data: Dict):
+    def _save_graph_updates(self, graph_name: str, graph_data: dict):
         """Save graph updates back to disk using concurrent-safe GraphStore."""
         try:
             if graph_name in self.available_graphs:
@@ -1571,7 +1686,7 @@ DO NOT include any text before or after the JSON object."""
             print(f"[!] Failed to reload graph {graph_name}: {e}")
             return None
     
-    def _update_node(self, params: Dict) -> Dict:
+    def _update_node(self, params: dict) -> dict:
         """Update a node with observations or assumptions about its behavior."""
         node_id = params.get('node_id')
         if not node_id:
@@ -1652,7 +1767,7 @@ DO NOT include any text before or after the JSON object."""
             'graphs_updated': updated_graphs
         }
     
-    def _deep_think(self) -> Dict:
+    def _deep_think(self) -> dict:
         """Delegate deep analysis to the Strategist and form hypotheses accordingly."""
         try:
             # Removed hard minimum-context guardrail: different aspects require different
@@ -1767,7 +1882,7 @@ DO NOT include any text before or after the JSON object."""
         else:
             return 'security_issue'
     
-    def _form_hypothesis(self, params: Dict) -> Dict:
+    def _form_hypothesis(self, params: dict) -> dict:
         """Form a new hypothesis."""
         from .concurrent_knowledge import Hypothesis
         
@@ -1867,7 +1982,7 @@ DO NOT include any text before or after the JSON object."""
             'hypothesis_index': len(self.loaded_data['hypotheses']) - 1
         }
     
-    def _update_hypothesis(self, params: Dict) -> Dict:
+    def _update_hypothesis(self, params: dict) -> dict:
         """Update an existing hypothesis."""
         from .concurrent_knowledge import Evidence
         
@@ -1911,7 +2026,7 @@ DO NOT include any text before or after the JSON object."""
             'hypothesis_id': hyp_id
         }
     
-    def _generate_report(self, iterations: int) -> Dict:
+    def _generate_report(self, iterations: int) -> dict:
         """Generate final investigation report."""
         # Categorize hypotheses
         confirmed = [h for h in self.loaded_data['hypotheses'] if h['confidence'] >= 0.8]

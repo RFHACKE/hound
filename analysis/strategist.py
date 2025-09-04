@@ -4,7 +4,8 @@ Phase 2 introduces a minimal Strategist that can compose planning prompts and
 return structured plan items. The CLI will wire this in a later step.
 """
 
-from typing import List, Dict, Any, Optional
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 from llm.unified_client import UnifiedLLMClient
@@ -12,7 +13,7 @@ from llm.unified_client import UnifiedLLMClient
 
 class PlanItemSchema(BaseModel):
     goal: str = Field(description="Investigation goal or question")
-    focus_areas: List[str] = Field(default_factory=list)
+    focus_areas: list[str] = Field(default_factory=list)
     priority: int = Field(ge=1, le=10, description="1-10, 10 = highest")
     reasoning: str = Field(default="", description="Why this is promising")
     category: str = Field(default="aspect", description="aspect | suspicion")
@@ -20,10 +21,10 @@ class PlanItemSchema(BaseModel):
 
 
 class PlanBatch(BaseModel):
-    investigations: List[PlanItemSchema] = Field(default_factory=list)
+    investigations: list[PlanItemSchema] = Field(default_factory=list)
 
 
-def _choose_profile(cfg: Dict[str, Any]) -> str:
+def _choose_profile(cfg: dict[str, Any]) -> str:
     # Prefer explicit strategist, then guidance, then agent as last resort
     try:
         models = cfg.get("models", {})
@@ -39,7 +40,7 @@ def _choose_profile(cfg: Dict[str, Any]) -> str:
 class Strategist:
     """Senior planning agent."""
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None, debug: bool = False, session_id: Optional[str] = None, debug_logger=None):
+    def __init__(self, config: dict[str, Any] | None = None, debug: bool = False, session_id: str | None = None, debug_logger=None):
         self.config = config or {}
         profile = _choose_profile(self.config)
         
@@ -51,10 +52,15 @@ class Strategist:
         
         self.profile = profile
         self.llm = UnifiedLLMClient(cfg=self.config, profile=profile, debug_logger=self.debug_logger)
+        # Two-pass review toggle (off by default; enabled via config)
+        try:
+            self.two_pass_review = bool(self.config.get('strategist_two_pass_review', False))
+        except Exception:
+            self.two_pass_review = False
 
-    def plan_next(self, *, graphs_summary: str, completed: List[str], n: int = 5, 
-                  hypotheses_summary: Optional[str] = None, coverage_summary: Optional[str] = None, 
-                  ledger_summary: Optional[str] = None) -> List[Dict[str, Any]]:
+    def plan_next(self, *, graphs_summary: str, completed: list[str], n: int = 5, 
+                  hypotheses_summary: str | None = None, coverage_summary: str | None = None, 
+                  ledger_summary: str | None = None) -> list[dict[str, Any]]:
         """Plan the next n investigations from comprehensive audit context.
 
         Returns a list of dicts compatible with downstream display and PlanStore.
@@ -105,7 +111,6 @@ class Strategist:
         completed_str = "\n".join(f"- {c}" for c in completed) if completed else "(none)"
         hypotheses_str = hypotheses_summary or "(no hypotheses formed yet)"
         coverage_str = coverage_summary or "(no coverage data)"
-        ledger_str = ledger_summary or "(none)"
         
         # Calculate planning iteration count (this is passed as part of completed list)
         planning_iteration = len(completed) // n + 1 if n > 0 else 1
@@ -149,48 +154,63 @@ class Strategist:
             })
         return items
 
-    def revise_after(self, last_result: Dict[str, Any]) -> None:
+    def revise_after(self, last_result: dict[str, Any]) -> None:
         return None
 
-    def deep_think(self, *, context: str) -> List[Dict[str, Any]]:
+    def deep_think(self, *, context: str) -> list[dict[str, Any]]:
         """Perform senior deep analysis on the prepared context and emit hypothesis items.
 
         Returns a list of dicts with keys:
           description, details, vulnerability_type, severity, confidence, node_ids, reasoning
         """
+        # Extract valid node IDs from context for validation
+        import re
+        node_id_pattern = r'\[([a-zA-Z0-9_]+)\]'
+        valid_node_ids = set(re.findall(node_id_pattern, context))
         system = (
             "You are a deep-thinking senior smart-contract security auditor.\n"
             "Your job is to: (1) think deeply about the active investigation aspect,\n"
-            "(2) uncover real, non-trivial vulnerabilities as clear hypotheses, and (3) advise the Scout on next steps.\n\n"
+            "(2) uncover real, non-trivial vulnerabilities as clear hypotheses, and (3) advise the Scout on next steps.\n"
+            "Additionally, if the prepared context reveals other vulnerabilities not strictly tied to the investigation goal, include them as well.\n\n"
             "OPERATING CONSTRAINTS (IMPORTANT):\n"
             "- Hound cannot run code, connect to RPC, fork a chain, deploy contracts, or query on-chain state.\n"
             "- Do NOT recommend or assume live on-chain probing (e.g., calling initialize() on proxies, forking tests, deploying mocks).\n"
             "- All GUIDANCE must be CODE-ONLY: which files/functions/modifiers/storage to inspect and what to verify statically.\n"
             "- You MAY include a theoretical exploit plan (selectors, calldata, sequence, preconditions) clearly labeled as \"theoretical/manual reproduction outside Hound\".\n\n"
-            "CRITICAL: Base your analysis on the investigation goal and the exploration/history shown in the context.\n"
-            "Be precise, avoid generic statements, and only propose hypotheses you can justify from the provided context.\n"
+            "CRITICAL: Base your analysis on the investigation goal and the exploration/history shown in the context,\n"
+            "but do NOT limit yourself to only that goal — surface ANY vulnerabilities you can justify from the provided context.\n"
+            "ANTI–FALSE-POSITIVE GUARDRAILS:\n"
+            "- Propose a hypothesis only if the ROOT CAUSE is explicitly evidenced in the provided code.\n"
+            "- Cite specific files/functions in Affected Code; include exact node IDs from the graphs.\n"
+            "- Verify that required preconditions are plausible given the code; check for guards/require/reentrancy/permissions that would mitigate the issue.\n"
+            "- If evidence is weak or ambiguous, lower confidence to low or omit the hypothesis entirely.\n"
+            "- Prefer fewer, higher-quality hypotheses over speculative ones.\n"
             "If you are highly confident there are no vulnerabilities in scope, say so.\n"
         )
         user = (
             "CONTEXT (includes === INVESTIGATION GOAL === and compressed history):\n" + context + "\n\n"
             "OUTPUT INSTRUCTIONS:\n"
-            "1) HYPOTHESES (one per line, exactly this pipe-separated format):\n"
-            "   Title | Type | Root Cause | Attack Vector | Affected Nodes | Affected Code | Severity | Confidence | Reasoning\n"
+            "1) HYPOTHESES (max 5, one per line, exactly this pipe-separated format, avoid speculation):\n"
+            "   Title | Type | Root Cause | Attack Vector | Affected Node IDs | Affected Code | Severity | Confidence | Reasoning\n"
             "   - severity: critical|high|medium|low; confidence: high|medium|low\n"
             "   - Keep Title concise and actionable.\n"
+            "   - CRITICAL: Affected Node IDs must be EXACT node IDs from the graphs shown above (e.g., func_transfer, contract_Token, state_balances)\n"
+            "   - Use comma-separated list of actual node IDs from [brackets] in the graphs, NOT descriptions\n"
+            "   - You MUST provide at least one valid node ID for each hypothesis\n"
             "   - Affected Code should reference concrete functions/files if possible.\n\n"
             "2) GUIDANCE (next steps for the Scout):\n"
             "   - Provide 2–5 concrete CODE-ONLY actions to gather evidence or rule in/out the hypotheses (load/read specific files, trace auth/dataflow, check invariants).\n"
             "   - Reference specific nodes/functions/files the Scout should load or analyze next.\n"
             "   - Do NOT suggest forking networks, RPC calls, or on-chain probing.\n\n"
             "3) If NO credible hypothesis is found, include a line: NO_HYPOTHESES: true (still provide GUIDANCE).\n"
+            "4) You MAY include additional hypotheses that are unrelated to the exact goal if the current context clearly supports them (avoid false positives).\n"
         )
 
         # Save deep_think prompts to debug files if debug logger is available
         if self.debug_logger:
             try:
-                from pathlib import Path
                 from datetime import datetime
+                from pathlib import Path
                 # Prefer debug logger's output_dir for consistency; fallback to CWD/.hound_debug
                 base_dir = getattr(self.debug_logger, 'output_dir', None)
                 if not base_dir:
@@ -247,7 +267,7 @@ class Strategist:
             return []
 
         lines = [ln.strip() for ln in str(resp).splitlines() if ln.strip() and '|' in ln]
-        items: List[Dict[str, Any]] = []
+        items: list[dict[str, Any]] = []
         for ln in lines:
             parts = [p.strip() for p in ln.split('|')]
             title = parts[0] if len(parts) > 0 else "Hypothesis"
@@ -266,7 +286,26 @@ class Strategist:
             elif 'low' in conf_word:
                 confidence = 0.4
 
-            node_ids = [n.strip() for n in affected_nodes.split(',') if n.strip()] or ['system']
+            # Parse and validate node IDs
+            raw_node_ids = [n.strip() for n in affected_nodes.split(',') if n.strip()]
+            node_ids = []
+            
+            for nid in raw_node_ids:
+                # Check if this looks like a valid node ID (no spaces, reasonable length)
+                if nid in valid_node_ids:
+                    # It's a valid node ID from the context
+                    node_ids.append(nid)
+                elif len(nid) < 50 and ' ' not in nid and nid != '':
+                    # Might be a node ID not in context but looks valid
+                    node_ids.append(nid)
+                # Otherwise skip it (it's likely a description)
+            
+            # Skip hypotheses with no valid node IDs
+            if not node_ids:
+                # Log this for debugging if needed
+                print(f"[WARNING] Skipping hypothesis with no valid node IDs: {title}")
+                continue
+            
             details = (
                 f"VULNERABILITY TYPE: {vuln_type}\n"
                 f"ROOT CAUSE: {root_cause}\n"
@@ -286,6 +325,55 @@ class Strategist:
                 'node_ids': node_ids,
                 'reasoning': reasoning,
             })
-        return items
+        # Second-pass self-critique to reduce false positives (optional)
+        if not getattr(self, 'two_pass_review', False):
+            # Return first-pass items directly when two-pass review is disabled
+            return items
+
+        # Two-pass enabled: review the candidates
+        class _ReviewItem(BaseModel):
+            description: str
+            vulnerability_type: str
+            severity: str
+            confidence: float
+            node_ids: list[str]
+            reasoning: str
+            accept: bool = Field(description="Accept only if evidence in context clearly supports root cause and no strong mitigation exists.")
+            reason: str = Field(description="Why accepted/rejected; cite mitigating checks if rejecting.")
+
+        class _ReviewBatch(BaseModel):
+            items: list[_ReviewItem]
+
+        review_instr = (
+            "You previously proposed candidate hypotheses. Now act as a skeptical reviewer.\n"
+            "Reject any item lacking explicit evidence of the ROOT CAUSE in the provided context, or where guards/permissions clearly mitigate it.\n"
+            "Prefer fewer, higher-quality items. Keep at most 3 accepted items. Return JSON.\n"
+        )
+
+        cand_lines = []
+        for i, it in enumerate(items[:5], 1):
+            cand_lines.append(
+                f"{i}. {it['description']} | type={it['vulnerability_type']} | sev={it['severity']} | conf={it['confidence']} | nodes={','.join(it.get('node_ids') or [])}"
+            )
+        review_user = (
+            "CONTEXT (same as above):\n" + context + "\n\n"
+            "CANDIDATES:\n" + "\n".join(cand_lines) + "\n\n"
+            "Respond with JSON: {\"items\":[{...}]}, fields: description,vulnerability_type,severity,confidence,node_ids,reasoning,accept,reason."
+        )
+
+        try:
+            reviewed = self.llm.parse(system=review_instr, user=review_user, schema=_ReviewBatch)
+            accepted = [it.model_dump() for it in reviewed.items if it.accept]
+            # Sort by severity and confidence, cap at 3
+            def _sev_rank(s):
+                return {"critical":3,"high":2,"medium":1,"low":0}.get(str(s).lower(),1)
+            accepted.sort(key=lambda x: (_sev_rank(x.get('severity','medium')), x.get('confidence',0.0)), reverse=True)
+            return accepted[:3]
+        except Exception:
+            # Fallback: basic filter by severity/confidence and cap
+            def _sev_rank(s):
+                return {"critical":3,"high":2,"medium":1,"low":0}.get(str(s).lower(),1)
+            items.sort(key=lambda x: (_sev_rank(x.get('severity','medium')), x.get('confidence',0.0)), reverse=True)
+            return items[:3]
 
 __all__ = ["Strategist", "PlanItemSchema", "PlanBatch"]

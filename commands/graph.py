@@ -4,27 +4,26 @@
 import json
 import sys
 import time
-from pathlib import Path
-from typing import Optional
 from datetime import datetime
+from pathlib import Path
 
 import typer
-import yaml
-from rich.console import Console
-import sys
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
-from rich.panel import Panel
-from rich.table import Table
 from rich import box
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+from rich.table import Table
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from analysis.graph_builder import GraphBuilder
-from llm.token_tracker import get_token_tracker
 import random
-from ingest.manifest import RepositoryManifest
+
+from analysis.debug_logger import DebugLogger
+from analysis.graph_builder import GraphBuilder
 from ingest.bundles import AdaptiveBundler
+from ingest.manifest import RepositoryManifest
+from llm.token_tracker import get_token_tracker
 from visualization.dynamic_graph_viz import generate_dynamic_visualization
 
 console = Console()
@@ -33,34 +32,34 @@ console = Console()
 progress_console = Console(file=sys.stderr)
 
 
-def load_config(config_path: Optional[Path] = None) -> dict:
+def load_config(config_path: Path | None = None) -> dict:
     """Load configuration from YAML file."""
-    if config_path is None:
-        config_path = Path("config.yaml")
+    from utils.config_loader import load_config as _load_config
+    config = _load_config(config_path)
     
-    if not config_path.exists():
+    if not config and config_path:
+        # Only error if a specific path was requested but not found
         console.print(f"[red]Error: Config file not found: {config_path}[/red]")
         sys.exit(1)
     
-    with open(config_path) as f:
-        return yaml.safe_load(f)
+    return config
 
 
 def build(
     repo_path: str = typer.Argument(..., help="Path to repository to analyze"),
-    repo_id: Optional[str] = typer.Option(None, help="Repository ID"),
-    output_dir: Optional[str] = typer.Option(None, "--output", "-o", help="Output directory"),
-    config_path: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to config.yaml"),
+    repo_id: str | None = typer.Option(None, help="Repository ID"),
+    output_dir: str | None = typer.Option(None, "--output", "-o", help="Output directory"),
+    config_path: Path | None = typer.Option(None, "--config", "-c", help="Path to config.yaml"),
     max_iterations: int = typer.Option(3, "--iterations", "-i", help="Maximum iterations"),
     max_graphs: int = typer.Option(2, "--graphs", "-g", help="Number of graphs"),
-    focus_areas: Optional[str] = typer.Option(None, "--focus", "-f", help="Focus areas"),
-    file_filter: Optional[str] = typer.Option(None, "--files", help="File filter"),
+    focus_areas: str | None = typer.Option(None, "--focus", "-f", help="Focus areas"),
+    file_filter: str | None = typer.Option(None, "--files", help="File filter"),
     visualize: bool = typer.Option(True, "--visualize/--no-visualize", help="Generate HTML"),
     debug: bool = typer.Option(False, "--debug", "-d", help="Enable debug output"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Reduce output and disable animations"),
 ):
     """Build agent-driven knowledge graphs."""
-    start_time = time.time()
+    time.time()
     config = load_config(config_path)
     
     repo_path = Path(repo_path).resolve()
@@ -89,6 +88,11 @@ def build(
         "[white]This is not just a graph — it’s a starmap and YOU hold the pen.[/white]",
         "[white]Normal mapping guides; YOUR mapping makes pathways beg to be used.[/white]",
     ]))
+    
+    # Create debug logger if needed
+    debug_logger = None
+    if debug:
+        debug_logger = DebugLogger(session_id=f"graph_{repo_name}_{int(time.time())}")
     
     try:
         files_to_include = [f.strip() for f in file_filter.split(",")] if file_filter else None
@@ -151,7 +155,7 @@ def build(
             if focus_list:
                 log_line('build', f"Focus areas: {', '.join(focus_list)}")
 
-            builder = GraphBuilder(config, debug=debug)
+            builder = GraphBuilder(config, debug=debug, debug_logger=debug_logger)
 
             # Narrative model names
             models = (config or {}).get('models', {})
@@ -174,7 +178,7 @@ def build(
                     console=progress_console,
                     transient=True,
                 ) as progress:
-                    task = progress.add_task(f"Constructing graphs (iteration 0/{iteration_total})...", total=iteration_total)
+                    task = progress.add_task(f"Constructing graphs (iteration 0/{iteration_total})...", total=iteration_total, completed=0)
 
                     def builder_callback(info):
                         # Handles dict payloads from GraphBuilder._emit
@@ -196,7 +200,20 @@ def build(
                                     msg,
                                 ])
                                 log_line(kind, line)
-                                progress.update(task, description=_short(line, 80))
+                                
+                                # Parse iteration from building messages
+                                import re
+                                m = re.search(r"iteration\s+(\d+)/(\d+)", msg)
+                                if m:
+                                    cur = int(m.group(1))
+                                    total = int(m.group(2))
+                                    if total != progress.tasks[task].total:
+                                        progress.update(task, total=total)
+                                    # Update both completed and description
+                                    completed = min(cur, total)
+                                    progress.update(task, completed=completed, description=f"Constructing graphs (iteration {cur}/{total})...")
+                                else:
+                                    progress.update(task, description=_short(line, 80))
                             elif kind == 'update':
                                 line = random.choice([
                                     f"🔧 {graph_model} chisels the graph: {msg}",
@@ -314,6 +331,11 @@ def build(
                 console.print(f"\n[bold]Open in browser:[/bold] [link]file://{html_path.resolve()}[/link]")
                 console.print(f"\n[dim]Tip: Use 'hound graph export {repo_name} --open' to regenerate and open visualization[/dim]")
     
+        # Finalize debug log if enabled
+        if debug and debug_logger:
+            log_path = debug_logger.finalize()
+            console.print(f"\n[cyan]Debug log saved:[/cyan] {log_path}")
+        
         console.print(Panel.fit(
             "[green]✓[/green] Graph building complete!",
             box=box.ROUNDED,
@@ -322,19 +344,23 @@ def build(
     
     except Exception as e:
         console.print(f"[red]Error during graph building: {e}[/red]")
+        # Finalize debug log on error
+        if debug and debug_logger:
+            log_path = debug_logger.finalize()
+            console.print(f"\n[cyan]Debug log saved:[/cyan] {log_path}")
         raise
 
 
 def ingest(
     repo_path: str = typer.Argument(..., help="Path to repository to analyze"),
-    output_dir: Optional[str] = typer.Option(None, "--output", "-o", help="Output directory"),
-    config_path: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to config.yaml"),
-    file_filter: Optional[str] = typer.Option(None, "--files", "-f", help="Comma-separated file paths"),
+    output_dir: str | None = typer.Option(None, "--output", "-o", help="Output directory"),
+    config_path: Path | None = typer.Option(None, "--config", "-c", help="Path to config.yaml"),
+    file_filter: str | None = typer.Option(None, "--files", "-f", help="Comma-separated file paths"),
     debug: bool = typer.Option(False, "--debug", "-d", help="Enable debug output"),
 ):
     """Ingest repository and create bundles."""
-    from ingest.manifest import RepositoryManifest
     from ingest.bundles import AdaptiveBundler
+    from ingest.manifest import RepositoryManifest
     
     config = load_config(config_path)
     

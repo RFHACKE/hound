@@ -3,10 +3,11 @@ Professional security audit report generator.
 """
 
 import json
-from pathlib import Path
-from datetime import datetime
-from typing import Dict, List, Optional, Any
 import math
+from collections.abc import Callable
+from datetime import datetime
+from pathlib import Path
+from typing import Any
 
 from llm.unified_client import UnifiedLLMClient
 
@@ -14,11 +15,12 @@ from llm.unified_client import UnifiedLLMClient
 class ReportGenerator:
     """Generate professional security audit reports."""
     
-    def __init__(self, project_dir: Path, config: Dict, debug: bool = False):
+    def __init__(self, project_dir: Path, config: dict, debug: bool = False, include_all: bool = False):
         """Initialize report generator."""
         self.project_dir = project_dir
         self.config = config
         self.debug = debug
+        self.include_all = include_all  # Flag to include all hypotheses, not just confirmed
         
         # Initialize reporting LLM
         self.llm = UnifiedLLMClient(
@@ -32,15 +34,16 @@ class ReportGenerator:
         self.hypotheses = self._load_hypotheses()
         self.hypothesis_metadata = self._load_hypothesis_metadata()
         self.agent_runs = self._load_agent_runs()
+        self.pocs = self._load_pocs()  # Load available PoCs
         # Debug helpers for CLI
-        self.last_prompt: Optional[str] = None
-        self.last_response: Optional[str] = None
+        self.last_prompt: str | None = None
+        self.last_response: str | None = None
         # Optional progress callback
         self._progress_cb = None
         
         # Load card store + repo root for precise code snippets
-        self.card_store: Dict[str, Dict[str, Any]] = {}
-        self.repo_root: Optional[Path] = None
+        self.card_store: dict[str, dict[str, Any]] = {}
+        self.repo_root: Path | None = None
         self._load_card_store_and_repo_root()
 
     def _load_card_store_and_repo_root(self) -> None:
@@ -53,7 +56,7 @@ class ReportGenerator:
             graphs_dir = self.project_dir / "graphs"
             kg_path = graphs_dir / "knowledge_graphs.json"
             if kg_path.exists():
-                with open(kg_path, 'r') as f:
+                with open(kg_path) as f:
                     kg = json.load(f)
                 # Repo root from manifest
                 manifest = kg.get('manifest') or {}
@@ -67,7 +70,7 @@ class ReportGenerator:
                 card_store_path = kg.get('card_store_path')
                 if card_store_path:
                     try:
-                        with open(card_store_path, 'r') as f:
+                        with open(card_store_path) as f:
                             store = json.load(f)
                         if isinstance(store, dict):
                             self.card_store = store
@@ -75,7 +78,7 @@ class ReportGenerator:
                         # Try local graphs dir fallback
                         csp = graphs_dir / "card_store.json"
                         if csp.exists():
-                            with open(csp, 'r') as f2:
+                            with open(csp) as f2:
                                 store = json.load(f2)
                             if isinstance(store, dict):
                                 self.card_store = store
@@ -83,7 +86,7 @@ class ReportGenerator:
                 # Try direct card_store.json
                 csp = self.project_dir / "graphs" / "card_store.json"
                 if csp.exists():
-                    with open(csp, 'r') as f3:
+                    with open(csp) as f3:
                         store = json.load(f3)
                     if isinstance(store, dict):
                         self.card_store = store
@@ -92,36 +95,82 @@ class ReportGenerator:
             if self.debug:
                 print("[!] Failed to load card store or repo root")
     
-    def _load_graphs(self) -> Dict[str, Any]:
+    def _load_graphs(self) -> dict[str, Any]:
         """Load all graphs from project."""
         graphs = {}
         graphs_dir = self.project_dir / "graphs"
         
         for graph_file in graphs_dir.glob("graph_*.json"):
-            with open(graph_file, 'r') as f:
+            with open(graph_file) as f:
                 data = json.load(f)
                 name = graph_file.stem.replace("graph_", "")
                 graphs[name] = data
         
         return graphs
     
-    def _load_hypotheses(self) -> Dict[str, Any]:
+    def _load_hypotheses(self) -> dict[str, Any]:
         """Load hypotheses from project."""
         hypothesis_file = self.project_dir / "hypotheses.json"
         if hypothesis_file.exists():
-            with open(hypothesis_file, 'r') as f:
+            with open(hypothesis_file) as f:
                 data = json.load(f)
                 return data.get("hypotheses", {})
         return {}
     
-    def _load_hypothesis_metadata(self) -> Dict[str, Any]:
+    def _load_hypothesis_metadata(self) -> dict[str, Any]:
         """Load hypothesis metadata (e.g., finalization model)."""
         hypothesis_file = self.project_dir / "hypotheses.json"
         if hypothesis_file.exists():
-            with open(hypothesis_file, 'r') as f:
+            with open(hypothesis_file) as f:
                 data = json.load(f)
                 return data.get("metadata", {})
         return {}
+    
+    def _load_pocs(self) -> dict[str, dict[str, Any]]:
+        """Load available PoCs for hypotheses."""
+        pocs = {}
+        poc_dir = self.project_dir / "poc"
+        
+        if not poc_dir.exists():
+            return pocs
+        
+        # Scan each hypothesis directory
+        for hyp_dir in poc_dir.iterdir():
+            if not hyp_dir.is_dir():
+                continue
+            
+            hypothesis_id = hyp_dir.name
+            metadata_file = hyp_dir / "metadata.json"
+            
+            if metadata_file.exists():
+                with open(metadata_file) as f:
+                    metadata = json.load(f)
+                
+                # Load actual PoC files
+                poc_files = []
+                for file_info in metadata.get('files', []):
+                    file_path = hyp_dir / file_info['name']
+                    if file_path.exists():
+                        try:
+                            with open(file_path) as f:
+                                content = f.read()
+                            poc_files.append({
+                                'name': file_info['name'],
+                                'content': content,
+                                'description': file_info.get('description', '')
+                            })
+                        except Exception as e:
+                            # Skip binary or unreadable files
+                            if self.debug:
+                                print(f"[!] Could not read PoC file {file_path}: {e}")
+                
+                if poc_files:
+                    pocs[hypothesis_id] = {
+                        'metadata': metadata,
+                        'files': poc_files
+                    }
+        
+        return pocs
     
     def _format_graph_name(self, graph_name: str) -> str:
         """Format graph names to be human-readable.
@@ -182,7 +231,7 @@ class ReportGenerator:
         
         return result.title()
     
-    def _extract_audit_models(self) -> Dict[str, List[str]]:
+    def _extract_audit_models(self) -> dict[str, list[str]]:
         """Extract all models involved in the audit process from various sources."""
         junior_models = set()
         senior_models = set()
@@ -321,17 +370,17 @@ class ReportGenerator:
         
         return name_map.get(model_name.lower(), model_name)
     
-    def _load_agent_runs(self) -> List[Dict]:
+    def _load_agent_runs(self) -> list[dict]:
         """Load agent run summaries."""
         runs = []
         agent_dir = self.project_dir / "agent_runs"
         if agent_dir.exists():
             for run_file in agent_dir.glob("*.json"):
-                with open(run_file, 'r') as f:
+                with open(run_file) as f:
                     runs.append(json.load(f))
         return runs
 
-    def _get_system_architecture_graph(self) -> Optional[Dict[str, Any]]:
+    def _get_system_architecture_graph(self) -> dict[str, Any] | None:
         """Return the full System Architecture graph data if available."""
         if 'SystemArchitecture' in self.graphs:
             return self.graphs['SystemArchitecture']
@@ -341,7 +390,7 @@ class ReportGenerator:
                 return self.graphs[key]
         return next(iter(self.graphs.values())) if self.graphs else None
 
-    def _generate_sections(self, project_name: str, project_source: str) -> Dict[str, str]:
+    def _generate_sections(self, project_name: str, project_source: str) -> dict[str, str]:
         """Single LLM call that returns both executive summary and system overview."""
         system_graph = self._get_system_architecture_graph() or {}
         
@@ -359,7 +408,7 @@ class ReportGenerator:
         all_analysis_models = set()
         all_analysis_models.update(junior_auditors)
         all_analysis_models.update(senior_auditors)
-        analysis_models = sorted(list(all_analysis_models))
+        sorted(list(all_analysis_models))
         
         # Provide full system graph and full hypotheses store
         hypotheses_payload = {
@@ -464,9 +513,9 @@ class ReportGenerator:
 
     # Note: No fallback generators — we surface errors so the CLI can show details
     
-    def generate(self, project_name: str, project_source: str, 
-                title: str, auditors: List[str], format: str = 'html',
-                progress_callback: Optional[callable] = None) -> str:
+    def generate(self, project_name: str, project_source: str,
+                title: str, auditors: list[str], format: str = 'html',
+                progress_callback: Callable[[dict], None] | None = None) -> str:
         """Generate the complete audit report."""
         self._progress_cb = progress_callback
         self._emit_progress('start', 'Starting report generation')
@@ -506,10 +555,12 @@ class ReportGenerator:
         executive_summary = sections.get('executive_summary', '')
         system_overview = sections.get('system_overview', '')
         
-        # Get confirmed findings (if any)
-        self._emit_progress('findings', 'Collecting confirmed findings')
+        # Get findings (confirmed or all based on include_all flag)
+        findings_msg = 'Collecting ALL hypotheses (no QA performed)' if self.include_all else 'Collecting confirmed findings'
+        self._emit_progress('findings', findings_msg)
         confirmed_findings = self._get_confirmed_findings()
-        self._emit_progress('findings_done', f"Processed {len(confirmed_findings)} findings")
+        findings_label = 'hypotheses' if self.include_all else 'findings'
+        self._emit_progress('findings_done', f"Processed {len(confirmed_findings)} {findings_label}")
         
         # No longer generating appendix
         # tested_hypotheses = self._get_all_hypotheses()
@@ -580,7 +631,7 @@ class ReportGenerator:
         models = self._extract_audit_models()
         junior_auditors = models['junior']
         senior_auditors = models['senior']
-        finalize_model = models['finalize'] or 'unspecified'
+        models['finalize'] or 'unspecified'
         
         # Combine for lead auditors list (deduplicated)
         all_auditors = sorted(set(junior_auditors + senior_auditors))
@@ -588,23 +639,35 @@ class ReportGenerator:
         if not models_used:
             models_used = ['unspecified']
 
+        # Add warning about unreviewed findings if include_all is True
+        qa_warning = ""
+        findings_label = "Confirmed vulnerabilities"
+        if self.include_all:
+            qa_warning = """
+IMPORTANT NOTE: This report includes ALL hypotheses generated during analysis, not just confirmed findings.
+No quality assurance or review process has been performed on these findings.
+This report may contain false positives and should be treated as a preliminary analysis only.
+"""
+            findings_label = "Total hypotheses (UNREVIEWED)"
+
         prompt = f"""You are a senior security auditor writing the executive summary for a professional audit report.
 
 Project: {project_name}
 Source: {project_source}
-
+{qa_warning}
 System Characteristics (from architecture analysis):
 {graph_summary}
 
 Audit Statistics:
 - Total security concerns investigated: {total_investigations}
-- Confirmed vulnerabilities: {confirmed_count}
+- {findings_label}: {confirmed_count}
 {findings_summary}
 
 Write a professional executive summary (2-3 paragraphs) that:
-1) States that the Hound security team conducted this comprehensive security audit of {project_name}.
+1) States that the Hound security team conducted this {'preliminary' if self.include_all else 'comprehensive'} security audit of {project_name}.
 2) Describes WHAT the system does (type and core purpose) based on the components above.
 3) Summarizes the security posture and any findings discovered.
+{'4) CRITICAL: Include a clear warning that this report contains UNREVIEWED findings that have not undergone quality assurance and may contain false positives.' if self.include_all else ''}
 
 CRITICAL INSTRUCTIONS:
 - DO NOT mention any specific model names (GPT-5, Claude, etc.) - a table below will show this
@@ -614,7 +677,8 @@ CRITICAL INSTRUCTIONS:
 - Focus on the AUDIT RESULTS not the audit process
 - NEVER use: "hypothesis", "AI", "model", "automated", "LLM", or made-up names
 - ALWAYS use: "findings", "security concerns", "team", "analysis"
-- Present this as a professional security audit by the Hound team"""
+- Present this as a professional security audit by the Hound team
+{'- MUST include clear warning about unreviewed findings and potential false positives' if self.include_all else ''}"""
 
         try:
             summary = self.llm.raw(
@@ -677,7 +741,7 @@ and systematic vulnerability assessment across all identified attack surfaces.""
         
         return '\n'.join(summary_parts) if summary_parts else "Complex smart contract system"
     
-    def _summarize_findings(self, findings: List[Dict]) -> str:
+    def _summarize_findings(self, findings: list[dict]) -> str:
         """Create a brief findings summary for executive summary."""
         if not findings:
             return "\nNo critical vulnerabilities were confirmed during this audit."
@@ -744,13 +808,14 @@ and systematic vulnerability assessment across all identified attack surfaces.""
         
         return '\n'.join(f"- {part}" for part in scope_parts)
     
-    def _get_confirmed_findings(self) -> List[Dict]:
-        """Get confirmed vulnerability findings."""
+    def _get_confirmed_findings(self) -> list[dict]:
+        """Get confirmed vulnerability findings (or all if include_all is True)."""
         findings = []
         
-        # First collect all confirmed findings
+        # Collect findings based on include_all flag
         for hyp_id, hyp in self.hypotheses.items():
-            if hyp.get('status') == 'confirmed':
+            # Include all hypotheses if flag is set, otherwise only confirmed
+            if self.include_all or hyp.get('status') == 'confirmed':
                 finding = {
                     'id': hyp_id,
                     'title': hyp.get('title', 'Unknown'),
@@ -763,7 +828,8 @@ and systematic vulnerability assessment across all identified attack surfaces.""
                     'junior_model': hyp.get('junior_model'),
                     'senior_model': hyp.get('senior_model'),
                     'supporting_evidence': hyp.get('supporting_evidence', []),
-                    'properties': hyp.get('properties', {})
+                    'properties': hyp.get('properties', {}),
+                    'qa_comment': hyp.get('qa_comment', '')  # Include QA comment if available
                 }
                 findings.append(finding)
         
@@ -802,7 +868,7 @@ and systematic vulnerability assessment across all identified attack surfaces.""
             except Exception:
                 pass
     
-    def _get_all_hypotheses(self) -> List[Dict]:
+    def _get_all_hypotheses(self) -> list[dict]:
         """Get all tested hypotheses for appendix."""
         tested = []
         
@@ -1347,6 +1413,65 @@ External dependencies are limited and clearly defined."""
             color: #64738c;
         }}
         
+        /* Proof of Concept Styles */
+        .poc-section {{
+            margin-top: 2rem;
+            padding: 1.5rem;
+            background: linear-gradient(135deg, rgba(26,31,46,0.7) 0%, rgba(15,20,25,0.8) 100%);
+            border-radius: 12px;
+            border: 1px solid rgba(100,181,246,0.2);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3),
+                        inset 0 1px 0 rgba(255,255,255,0.05);
+        }}
+        
+        .poc-section h4 {{
+            color: #64b5f6;
+            margin-bottom: 1rem;
+            font-size: 1.1rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }}
+        
+        .poc-file {{
+            margin-bottom: 1.5rem;
+            background: rgba(20,25,35,0.5);
+            padding: 1rem;
+            border-radius: 8px;
+            border: 1px solid rgba(100,181,246,0.1);
+        }}
+        
+        .poc-file h5 {{
+            color: #90caf9;
+            font-family: 'JetBrains Mono', 'Courier New', monospace;
+            font-size: 0.95rem;
+            margin-bottom: 0.5rem;
+            font-weight: 500;
+        }}
+        
+        .poc-description {{
+            color: #8892a9;
+            font-style: italic;
+            margin-bottom: 1rem;
+            font-size: 0.9rem;
+        }}
+        
+        .poc-file pre {{
+            background: rgba(10,12,18,0.7);
+            border: 1px solid rgba(100,181,246,0.1);
+            padding: 1rem;
+            border-radius: 8px;
+            overflow-x: auto;
+            margin: 0;
+        }}
+        
+        .poc-file code {{
+            color: #e0e0e0;
+            font-family: 'JetBrains Mono', 'Courier New', monospace;
+            font-size: 0.9rem;
+            line-height: 1.5;
+        }}
+        
         /* Statistics Section Styles */
         .stats-section {{
             margin: 60px 0;
@@ -1680,7 +1805,8 @@ External dependencies are limited and clearly defined."""
         {self._generate_statistics_section_html(kwargs['findings'])}
         
         <div class="section">
-            <h2>Findings</h2>
+            <h2>{'All Hypotheses (UNREVIEWED)' if self.include_all else 'Findings'}</h2>
+            {self._add_unreviewed_warning_html() if self.include_all else ''}
             {self._format_findings_html(kwargs['findings'])}
         </div>
         
@@ -1699,6 +1825,37 @@ External dependencies are limited and clearly defined."""
         paragraphs = (text or '').strip().split('\n\n')
         return '\n'.join(f'<p>{p.strip()}</p>' for p in paragraphs if p.strip())
     
+    def _format_poc_html(self, poc_data: dict[str, Any]) -> str:
+        """Format PoC files as HTML with syntax highlighting."""
+        if not poc_data or not poc_data.get('files'):
+            return ''
+        
+        html_parts = ['<div class="poc-section">']
+        html_parts.append('<h4>Proof of Concept</h4>')
+        
+        for poc_file in poc_data['files']:
+            name = poc_file['name']
+            content = poc_file['content']
+            description = poc_file.get('description', '')
+            
+            # Detect language from file extension
+            lang = self._detect_language(name)
+            
+            # Format the PoC
+            html_parts.append('<div class="poc-file">')
+            html_parts.append(f'<h5>{self._escape_html(name)}</h5>')
+            
+            if description:
+                html_parts.append(f'<p class="poc-description">{self._escape_html(description)}</p>')
+            
+            # Format code with syntax highlighting
+            escaped_content = self._escape_html(content)
+            html_parts.append(f'<pre><code class="language-{lang}">{escaped_content}</code></pre>')
+            html_parts.append('</div>')
+        
+        html_parts.append('</div>')
+        return '\n'.join(html_parts)
+    
     def _format_component_diagram_html(self, diagram: str) -> str:
         """Format component diagram into HTML."""
         if not diagram or not diagram.strip():
@@ -1711,7 +1868,7 @@ External dependencies are limited and clearly defined."""
         </div>
         '''
     
-    def _generate_statistics_section_html(self, findings: List[Dict]) -> str:
+    def _generate_statistics_section_html(self, findings: list[dict]) -> str:
         """Generate beautiful statistics section with charts and numbers."""
         if not findings:
             return ''
@@ -1781,7 +1938,7 @@ External dependencies are limited and clearly defined."""
         
         return html
     
-    def _generate_pie_chart_svg(self, severity_counts: Dict[str, int]) -> str:
+    def _generate_pie_chart_svg(self, severity_counts: dict[str, int]) -> str:
         """Generate an SVG pie chart for severity distribution."""
         total = sum(severity_counts.values())
         if total == 0:
@@ -1875,7 +2032,7 @@ External dependencies are limited and clearly defined."""
         
         return svg
     
-    def _generate_legend_html(self, severity_counts: Dict[str, int], percentages: Dict[str, float]) -> str:
+    def _generate_legend_html(self, severity_counts: dict[str, int], percentages: dict[str, float]) -> str:
         """Generate legend HTML for the pie chart."""
         colors = {
             'critical': '#dc3545',
@@ -1898,10 +2055,26 @@ External dependencies are limited and clearly defined."""
         
         return '\n'.join(items)
     
-    def _format_findings_html(self, findings: List[Dict]) -> str:
+    def _add_unreviewed_warning_html(self) -> str:
+        """Add a warning box for unreviewed findings."""
+        return """
+        <div style="background: #fff3cd; border: 2px solid #ffc107; border-radius: 8px; padding: 15px; margin-bottom: 20px;">
+            <h3 style="color: #856404; margin-top: 0;">⚠️ WARNING: Unreviewed Findings</h3>
+            <p style="color: #856404; margin-bottom: 0;">
+                This report includes ALL hypotheses generated during the analysis, not just confirmed findings.
+                No quality assurance or review process has been performed. These findings may contain false positives
+                and should be independently verified before taking action.
+            </p>
+        </div>
+        """
+    
+    def _format_findings_html(self, findings: list[dict]) -> str:
         """Format findings into HTML with code samples."""
         if not findings:
-            return '<p><em>No confirmed vulnerabilities were identified during this audit.</em></p>'
+            if self.include_all:
+                return '<p><em>No hypotheses were generated during this analysis.</em></p>'
+            else:
+                return '<p><em>No confirmed vulnerabilities were identified during this audit.</em></p>'
         
         html_parts = []
         for finding in findings:
@@ -1921,6 +2094,23 @@ External dependencies are limited and clearly defined."""
                 </div>
                 '''
             
+            # Add QA comment if available
+            qa_comment_html = ''
+            if finding.get('qa_comment'):
+                qa_comment_html = f'''
+                <div class="qa-comment" style="margin-top: 1em; padding: 15px; background: rgba(70, 130, 180, 0.1); border-left: 3px solid #4682b4; border-radius: 8px;">
+                    <strong style="color: #64b5f6;">QA Review:</strong> 
+                    <span style="color: #c3cfe2; line-height: 1.6;">{self._escape_html(finding['qa_comment'])}</span>
+                </div>
+                '''
+            
+            # Check if there's a PoC for this hypothesis
+            poc_html = ''
+            hypothesis_id = finding.get('id', '')
+            if hypothesis_id and hypothesis_id in self.pocs:
+                poc_data = self.pocs[hypothesis_id]
+                poc_html = self._format_poc_html(poc_data)
+            
             html_parts.append(f'''
             <div class="finding {severity}">
                 <span class="severity-badge severity-{severity}">{severity}</span>
@@ -1929,13 +2119,15 @@ External dependencies are limited and clearly defined."""
                     {self._format_paragraphs_html(finding.get('professional_description', finding['description']))}
                 </div>
                 <p><strong>Affected Components:</strong> {finding.get('affected_description', self._describe_affected_components(finding.get('affected', [])))}</p>
+                {qa_comment_html}
                 {code_html}
+                {poc_html}
             </div>
             ''')
         
         return '\n'.join(html_parts)
     
-    def _describe_affected_components(self, node_refs: List[str]) -> str:
+    def _describe_affected_components(self, node_refs: list[str]) -> str:
         """Generate human-readable descriptions of affected components."""
         if not node_refs:
             return "Various system components"
@@ -1943,7 +2135,7 @@ External dependencies are limited and clearly defined."""
         # Just pass the raw node references to the LLM
         return ', '.join(node_refs[:3])  # Will be formatted by LLM in batch
     
-    def _batch_generate_vulnerability_descriptions(self, findings: List[Dict]) -> Dict[int, str]:
+    def _batch_generate_vulnerability_descriptions(self, findings: list[dict]) -> dict[int, str]:
         """Batch generate professional vulnerability descriptions using LLM."""
         if not findings:
             return {}
@@ -2033,7 +2225,7 @@ Rules for affected components:
                 print(f"[!] Failed to batch generate descriptions: {e}")
             return {}
     
-    def _generate_vulnerability_description(self, finding: Dict) -> str:
+    def _generate_vulnerability_description(self, finding: dict) -> str:
         """Generate a professional vulnerability description using LLM."""
         
         # Extract key information from the raw description
@@ -2113,7 +2305,7 @@ Rules:
             .replace('"', '&quot;')
             .replace("'", '&#39;'))
     
-    def _format_test_coverage_html(self, hypotheses: List[Dict]) -> str:
+    def _format_test_coverage_html(self, hypotheses: list[dict]) -> str:
         """Format test coverage into HTML."""
         if not hypotheses:
             return '<p><em>No security tests were recorded.</em></p>'
@@ -2198,24 +2390,29 @@ The audit employed a comprehensive security assessment methodology including:
         
         return md
     
-    def _format_findings_markdown(self, findings: List[Dict]) -> str:
+    def _format_findings_markdown(self, findings: list[dict]) -> str:
         """Format findings for Markdown."""
         if not findings:
             return '*No confirmed vulnerabilities were identified during this audit.*'
         
         md_parts = []
         for finding in findings:
+            # Include QA comment if available
+            qa_comment = ''
+            if finding.get('qa_comment'):
+                qa_comment = f"\n\n**QA Review:** {finding['qa_comment']}"
+            
             md_parts.append(f"""### [{finding['severity'].upper()}] {finding['title']}
 
 **Affected:** {finding.get('affected_description', self._describe_affected_components(finding.get('affected', [])))}  
 
-{finding.get('professional_description', finding['description'])}
+{finding.get('professional_description', finding['description'])}{qa_comment}
 
 ---""")
         
         return '\n\n'.join(md_parts)
     
-    def _extract_code_for_finding(self, finding: Dict) -> List[Dict]:
+    def _extract_code_for_finding(self, finding: dict) -> list[dict]:
         """Extract relevant code snippets for a finding.
 
         Priority order:
@@ -2238,16 +2435,16 @@ The audit employed a comprehensive security assessment methodology including:
         # 3) Fallback to previous file-level LLM approach
         return self._extract_code_via_llm_file_scan(finding)
 
-    def _collect_files_from_cards(self, finding: Dict) -> Dict[str, str]:
+    def _collect_files_from_cards(self, finding: dict) -> dict[str, str]:
         """Return map of relpath -> full file content for files referenced by card evidence."""
-        files: Dict[str, str] = {}
+        files: dict[str, str] = {}
         try:
             if not self.card_store or not self.repo_root or not self.repo_root.exists():
                 return files
             target_ids = set(str(x) for x in finding.get('affected', []) if x)
             if not target_ids:
                 return files
-            rels: List[str] = []
+            rels: list[str] = []
             for graph in self.graphs.values():
                 for node in graph.get('nodes', []):
                     nid = str(node.get('id') or '')
@@ -2274,7 +2471,7 @@ The audit employed a comprehensive security assessment methodology including:
         except Exception:
             return {}
 
-    def _select_snippets_with_reporting_llm(self, finding: Dict, files_ctx: Dict[str, str]) -> List[Dict]:
+    def _select_snippets_with_reporting_llm(self, finding: dict, files_ctx: dict[str, str]) -> list[dict]:
         """Use reporting LLM to select concise snippets across provided files with explanations.
         Strongly prefer functions explicitly referenced by the finding.
         """
@@ -2315,7 +2512,7 @@ The audit employed a comprehensive security assessment methodology including:
             response = self.llm.raw(system=system, user=user)
             from utils.json_utils import extract_json_object
             obj = extract_json_object(response)
-            results: List[Dict] = []
+            results: list[dict] = []
             if isinstance(obj, dict) and isinstance(obj.get('snippets'), list):
                 for s in obj['snippets'][:3]:
                     fpath = s.get('file')
@@ -2351,7 +2548,7 @@ The audit employed a comprehensive security assessment methodology including:
         except Exception:
             return []
 
-    def _derive_target_functions(self, finding: Dict) -> set:
+    def _derive_target_functions(self, finding: dict) -> set:
         """Collect intended function names from hypothesis/finding metadata and affected nodes."""
         names = set()
         try:
@@ -2387,10 +2584,10 @@ The audit employed a comprehensive security assessment methodology including:
             pass
         return names
 
-    def _index_functions(self, files_ctx: Dict[str, str]) -> Dict[str, List[Dict[str, int]]]:
+    def _index_functions(self, files_ctx: dict[str, str]) -> dict[str, list[dict[str, int]]]:
         """Build a coarse function index per Solidity file: name, start_line, end_line."""
         import re
-        idx: Dict[str, List[Dict[str, int]]] = {}
+        idx: dict[str, list[dict[str, int]]] = {}
         for path, content in files_ctx.items():
             lines = content.split('\n')
             headers = []
@@ -2413,7 +2610,7 @@ The audit employed a comprehensive security assessment methodology including:
                 idx[path] = entries
         return idx
 
-    def _snippets_match_targets(self, snippets: List[Dict], func_index: Dict[str, List[Dict[str, int]]], targets: set) -> bool:
+    def _snippets_match_targets(self, snippets: list[dict], func_index: dict[str, list[dict[str, int]]], targets: set) -> bool:
         """Check if at least one snippet falls within a targeted function."""
         if not targets:
             return True
@@ -2429,9 +2626,9 @@ The audit employed a comprehensive security assessment methodology including:
                         return True
         return False
 
-    def _deterministic_snippets_by_function(self, files_ctx: Dict[str, str], func_index: Dict[str, List[Dict[str, int]]], targets: set) -> List[Dict]:
+    def _deterministic_snippets_by_function(self, files_ctx: dict[str, str], func_index: dict[str, list[dict[str, int]]], targets: set) -> list[dict]:
         """If targets are available, cut short snippets directly from those function bodies."""
-        results: List[Dict] = []
+        results: list[dict] = []
         for path, entries in func_index.items():
             for e in entries:
                 if e['name'] in targets or (e.get('kind') == 'constructor' and 'constructor' in targets):
@@ -2451,7 +2648,7 @@ The audit employed a comprehensive security assessment methodology including:
                         return results
         return results
 
-    def _extract_code_via_cards(self, finding: Dict) -> List[Dict]:
+    def _extract_code_via_cards(self, finding: dict) -> list[dict]:
         """Use node->card mappings to pull precise source slices.
         Merges adjacent/overlapping card ranges per file to avoid duplicates.
         """
@@ -2463,7 +2660,7 @@ The audit employed a comprehensive security assessment methodology including:
             if not target_ids:
                 return []
             # Gather card IDs from matching nodes across all graphs
-            card_ids: List[str] = []
+            card_ids: list[str] = []
             matched_nodes = 0
             for graph in self.graphs.values():
                 for node in graph.get('nodes', []):
@@ -2479,7 +2676,7 @@ The audit employed a comprehensive security assessment methodology including:
             if not card_ids and self.debug:
                 print(f"[!] No card refs found for affected nodes: {sorted(list(target_ids))}")
             # Group ranges per file
-            per_file: Dict[str, List[tuple]] = {}
+            per_file: dict[str, list[tuple]] = {}
             for cid in card_ids:
                 c = self.card_store.get(cid)
                 if not isinstance(c, dict):
@@ -2491,7 +2688,7 @@ The audit employed a comprehensive security assessment methodology including:
                     continue
                 per_file.setdefault(rel, []).append((cs, ce))
 
-            samples: List[Dict] = []
+            samples: list[dict] = []
             for rel, ranges in per_file.items():
                 fpath = self.repo_root / rel
                 try:
@@ -2541,9 +2738,9 @@ The audit employed a comprehensive security assessment methodology including:
         end_line = start_line + within.count('\n')
         return start_line, end_line
 
-    def _extract_code_via_llm_file_scan(self, finding: Dict) -> List[Dict]:
+    def _extract_code_via_llm_file_scan(self, finding: dict) -> list[dict]:
         """Fallback: scan likely files and ask LLM for relevant line ranges."""
-        code_samples: List[Dict] = []
+        code_samples: list[dict] = []
         
         # First check if the finding itself has source_files in properties
         if 'properties' in finding and 'source_files' in finding.get('properties', {}):
@@ -2584,7 +2781,7 @@ The audit employed a comprehensive security assessment methodology including:
             project_file = self.project_dir / "project.json"
             if project_file.exists():
                 try:
-                    with open(project_file, 'r') as f:
+                    with open(project_file) as f:
                         project_data = json.load(f)
                         source_base_path = Path(project_data.get('source_path', ''))
                 except Exception:
@@ -2663,7 +2860,7 @@ Only include the most relevant 10-20 lines that directly relate to the vulnerabi
         ext = Path(file_path).suffix.lower()
         return ext_map.get(ext, 'plaintext')
     
-    def _format_test_coverage_markdown(self, hypotheses: List[Dict]) -> str:
+    def _format_test_coverage_markdown(self, hypotheses: list[dict]) -> str:
         """Format test coverage for Markdown."""
         if not hypotheses:
             return '*No security tests were recorded.*'

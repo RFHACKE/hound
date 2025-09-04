@@ -4,9 +4,9 @@ This module provides a Finalizer that focuses on filtering hypotheses and
 checking potential false positives via LLM, without positioning it as an agent.
 """
 
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from collections.abc import Callable
 from datetime import datetime
+from pathlib import Path
 
 from .agent_core import AutonomousAgent
 from .concurrent_knowledge import HypothesisStore
@@ -20,7 +20,7 @@ class Finalizer(AutonomousAgent):
 
     def __init__(self, graphs_metadata_path: Path, manifest_path: Path,
                  hypothesis_path: Path, agent_id: str,
-                 config: Optional[Dict] = None, debug: bool = False):
+                 config: dict | None = None, debug: bool = False):
         """Initialize finalizer."""
 
         # Call parent init (but we'll override the model profile)
@@ -47,9 +47,9 @@ class Finalizer(AutonomousAgent):
         self.candidates_to_review = []
         self.review_results = []
 
-    def finalize(self, candidates: List[Tuple[str, Dict]],
+    def finalize(self, candidates: list[tuple[str, dict]],
                  max_iterations: int = 10,
-                 progress_callback: Optional[callable] = None) -> Dict:
+                 progress_callback: Callable[[dict], None] | None = None) -> dict:
         """
         Main finalization method - review and confirm/reject hypotheses.
 
@@ -88,7 +88,7 @@ class Finalizer(AutonomousAgent):
 
             # Get source files from hypothesis properties
             source_files = hypothesis.get('properties', {}).get('source_files', [])
-            affected_functions = hypothesis.get('properties', {}).get('affected_functions', [])
+            hypothesis.get('properties', {}).get('affected_functions', [])
 
             # Load source code directly if available
             source_code = {}
@@ -97,7 +97,7 @@ class Finalizer(AutonomousAgent):
                     try:
                         full_path = self._repo_root / file_path
                         if full_path.exists():
-                            with open(full_path, 'r') as f:
+                            with open(full_path) as f:
                                 source_code[file_path] = f.read()
                     except Exception as e:
                         print(f"[!] Failed to load {file_path}: {e}")
@@ -112,10 +112,13 @@ class Finalizer(AutonomousAgent):
             if determination['verdict'] == 'confirmed':
                 self.finalize_store.adjust_confidence(hyp_id, 1.0, determination['reasoning'])
 
-                # Update status directly
+                # Update status and store QA comment
                 def update_status(data):
                     if hyp_id in data["hypotheses"]:
                         data["hypotheses"][hyp_id]["status"] = "confirmed"
+                        # Store QA comment for confirmed hypotheses
+                        if determination.get('reasoning'):
+                            data["hypotheses"][hyp_id]["qa_comment"] = determination['reasoning']
                         data["metadata"]["confirmed"] = sum(
                             1 for h in data["hypotheses"].values()
                             if h["status"] == "confirmed"
@@ -143,10 +146,13 @@ class Finalizer(AutonomousAgent):
             elif determination['verdict'] == 'rejected':
                 self.finalize_store.adjust_confidence(hyp_id, 0.0, determination['reasoning'])
 
-                # Update status directly
+                # Update status and store QA comment
                 def update_status(data):
                     if hyp_id in data["hypotheses"]:
                         data["hypotheses"][hyp_id]["status"] = "rejected"
+                        # Store QA comment for rejected hypotheses
+                        if determination.get('reasoning'):
+                            data["hypotheses"][hyp_id]["qa_comment"] = determination['reasoning']
                     return data, True
 
                 self.finalize_store.update_atomic(update_status)
@@ -177,7 +183,7 @@ class Finalizer(AutonomousAgent):
         # Generate report
         return self._generate_finalization_report(confirmed, rejected, uncertain)
 
-    def _build_review_context(self, hyp_id: str, hypothesis: Dict, source_code: Dict[str, str]) -> str:
+    def _build_review_context(self, hyp_id: str, hypothesis: dict, source_code: dict[str, str]) -> str:
         """Build context for reviewing a specific hypothesis."""
         context_parts = []
 
@@ -217,42 +223,25 @@ class Finalizer(AutonomousAgent):
 
         return "\n".join(context_parts)
 
-    def _get_determination(self, context: str) -> Dict:
+    def _get_determination(self, context: str) -> dict:
         """Get model's determination on the hypothesis."""
 
-        prompt = f"""You are a security expert performing final review of a vulnerability hypothesis.
-
-{context}
-
-=== YOUR TASK ===
-Review the SOURCE CODE provided to determine if this hypothesis represents a REAL vulnerability.
-
-Focus on:
-1. Does the SOURCE CODE show the vulnerability exists?
-2. Is there a clear attack vector in the code?
-3. Are there checks/guards that prevent exploitation?
-4. Is this a false positive based on the actual implementation?
-
-Examine the specific functions mentioned and trace the data flow.
-
-Provide your determination in this EXACT JSON format:
-{{
-    "verdict": "confirmed|rejected|uncertain",
-    "reasoning": "Brief explanation (max 100 chars)",
-    "confidence": 0.0-1.0
-}}
-
-Rules:
-- "confirmed" = Vulnerability clearly exists in the code with exploitable path
-- "rejected" = Code analysis shows this is a false positive or mitigated
-- "uncertain" = Need more code context to determine
-
-Be conservative - only confirm if the code clearly shows the vulnerability.
-"""
 
         try:
+            # Get reasoning effort from config if available
+            finalize_effort = None
+            try:
+                mdl_cfg = (self.config or {}).get('models', {}).get('finalize', {})
+                finalize_effort = mdl_cfg.get('reasoning_effort')
+            except Exception:
+                pass
+            
             # Request JSON and parse robustly
-            response_text = self.llm.raw(system="You are a security expert. Respond only with valid JSON.", user=context)
+            response_text = self.llm.raw(
+                system="You are a security expert. Respond only with valid JSON.", 
+                user=context,
+                reasoning_effort=finalize_effort
+            )
             from utils.json_utils import extract_json_object
             obj = extract_json_object(response_text)
             if isinstance(obj, dict):
@@ -266,7 +255,7 @@ Be conservative - only confirm if the code clearly shows the vulnerability.
             "confidence": 0.5
         }
 
-    def _generate_finalization_report(self, confirmed: int, rejected: int, uncertain: int) -> Dict:
+    def _generate_finalization_report(self, confirmed: int, rejected: int, uncertain: int) -> dict:
         """Generate final report."""
 
         confirmed_vulns = [r for r in self.review_results if r.get('verdict') == 'confirmed']

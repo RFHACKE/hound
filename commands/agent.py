@@ -3,39 +3,39 @@ Agent command for autonomous security analysis.
 """
 
 import json
-import click
+import random
+import sys
 import time
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, List
+
+import click
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
-from rich.progress import Progress, SpinnerColumn, TextColumn
-import random
-from rich.syntax import Syntax
-from datetime import datetime, timedelta
-import sys
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from analysis.scout import Scout
-from analysis.strategist import Strategist
-from analysis.session_tracker import SessionTracker
-from llm.token_tracker import get_token_tracker
 from pydantic import BaseModel, Field
+
+from analysis.scout import Scout
+from analysis.session_tracker import SessionTracker
+from analysis.strategist import Strategist
+from llm.token_tracker import get_token_tracker
+from llm.unified_client import UnifiedLLMClient
+
 
 def get_project_dir(project_id: str) -> Path:
     """Get project directory path."""
     return Path.home() / ".hound" / "projects" / project_id
 
-def run_investigation(project_path: str, prompt: str, iterations: Optional[int] = None, config_path: Optional[Path] = None, debug: bool = False, platform: Optional[str] = None, model: Optional[str] = None):
+def run_investigation(project_path: str, prompt: str, iterations: int | None = None, config_path: Path | None = None, debug: bool = False, platform: str | None = None, model: str | None = None):
     """Run a user-driven investigation."""
     console = Console()
     
     # Load config properly
-    from commands.graph import load_config
+    from utils.config_loader import load_config
     config = None
     
     try:
@@ -45,9 +45,8 @@ def run_investigation(project_path: str, prompt: str, iterations: Optional[int] 
                 config = load_config(config_path)
         else:
             # Try default config.yaml
-            default_config = Path("config.yaml")
-            if default_config.exists():
-                config = load_config(default_config)
+            # Load config using default search order
+            config = load_config()
     except Exception as e:
         console.print(f"[yellow]Warning: Could not load config: {e}[/yellow]")
         console.print("[yellow]Using default configuration[/yellow]")
@@ -119,13 +118,12 @@ def run_investigation(project_path: str, prompt: str, iterations: Optional[int] 
     )
     
     # Run investigation with live display
-    from rich.live import Live
-    from rich.panel import Panel
-    from rich.text import Text
-    
-    # Create a live display with rolling event log
-    from rich.markdown import Markdown
     from datetime import datetime
+
+    from rich.live import Live
+
+    # Create a live display with rolling event log
+    from rich.panel import Panel
     
     event_log = []  # list of strings (renderables)
     
@@ -216,12 +214,6 @@ def run_investigation(project_path: str, prompt: str, iterations: Optional[int] 
                     'rejected': report['hypotheses']['rejected']
                 })
                 console.print(f"\n[cyan]Debug log saved:[/cyan] {log_path}")
-                console.print(f"[dim]Open in browser: file://{log_path}[/dim]")
-                try:
-                    import webbrowser
-                    webbrowser.open(f"file://{log_path}")
-                except Exception:
-                    pass
             
         except Exception as e:
             console.print(f"[red]Investigation failed: {e}[/red]")
@@ -231,12 +223,6 @@ def run_investigation(project_path: str, prompt: str, iterations: Optional[int] 
                 if agent and agent.debug_logger:
                     log_path = agent.debug_logger.finalize()
                     console.print(f"\n[cyan]Debug log saved:[/cyan] {log_path}")
-                    console.print(f"[dim]Open in browser: file://{log_path}[/dim]")
-                    try:
-                        import webbrowser
-                        webbrowser.open(f"file://{log_path}")
-                    except Exception:
-                        pass
 
 def display_investigation_report(report: dict):
     """Display investigation report in a nice format."""
@@ -252,7 +238,7 @@ def display_investigation_report(report: dict):
     
     # Hypothesis summary
     hyp_stats = report['hypotheses']
-    console.print(f"[bold cyan]Hypotheses:[/bold cyan]")
+    console.print("[bold cyan]Hypotheses:[/bold cyan]")
     console.print(f"  • Total: {hyp_stats['total']}")
     console.print(f"  • [green]Confirmed: {hyp_stats['confirmed']}[/green]")
     console.print(f"  • [red]Rejected: {hyp_stats['rejected']}[/red]")
@@ -301,7 +287,7 @@ def display_investigation_report(report: dict):
         console.print()
     
     # Conclusion
-    console.print(f"[bold]Conclusion:[/bold]")
+    console.print("[bold]Conclusion:[/bold]")
     conclusion = report.get('conclusion', 'No conclusion available')
     if 'LIKELY TRUE' in conclusion:
         console.print(f"  [green]{conclusion}[/green]")
@@ -349,7 +335,7 @@ def format_tool_call(call):
     
     return Panel(
         content,
-        title=f"[bold cyan]Tool Call[/bold cyan]",
+        title="[bold cyan]Tool Call[/bold cyan]",
         border_style="cyan"
     )
 
@@ -570,10 +556,10 @@ def display_agent_summary(summary, time_limit_reached=False):
 class AgentRunner:
     """Manages agent execution with beautiful output."""
     
-    def __init__(self, project_id: str, config_path: Optional[Path] = None, 
-                 iterations: Optional[int] = None, time_limit_minutes: Optional[int] = None,
-                 debug: bool = False, platform: Optional[str] = None, model: Optional[str] = None,
-                 session: Optional[str] = None, new_session: bool = False):
+    def __init__(self, project_id: str, config_path: Path | None = None, 
+                 iterations: int | None = None, time_limit_minutes: int | None = None,
+                 debug: bool = False, platform: str | None = None, model: str | None = None,
+                 session: str | None = None, new_session: bool = False):
         self.project_id = project_id
         self.config_path = config_path
         self.max_iterations = iterations
@@ -584,12 +570,15 @@ class AgentRunner:
         self.agent = None
         self.start_time = None
         self.completed_investigations = []  # Track completed investigation goals
-        self.session_tracker: Optional[SessionTracker] = None
-        self.project_dir: Optional[Path] = None
+        self.session_tracker: SessionTracker | None = None
+        self.project_dir: Path | None = None
         self.plan_store = None
-        self.session_id: Optional[str] = session
+        self.session_id: str | None = session
         self.new_session: bool = new_session
-        self._agent_log: List[str] = []
+        self._agent_log: list[str] = []
+        self._last_applied_steer: str | None = None
+        # Track which steering text triggered a forced replan (to avoid repeats)
+        self._last_replan_steer: str | None = None
         
     def initialize(self):
         """Initialize the agent."""
@@ -611,7 +600,7 @@ class AgentRunner:
         # If knowledge_graphs.json doesn't exist, look for any graph file
         if knowledge_graphs_path.exists():
             # Use the SystemOverview graph or first available graph
-            with open(knowledge_graphs_path, 'r') as f:
+            with open(knowledge_graphs_path) as f:
                 graphs_meta = json.load(f)
             if graphs_meta.get('graphs'):
                 graphs_dict = graphs_meta['graphs']
@@ -650,7 +639,7 @@ class AgentRunner:
             return False
         
         # Load config properly using the standard method
-        from commands.graph import load_config
+        from utils.config_loader import load_config
         if self.config_path and self.config_path.exists():
             config = load_config(self.config_path)
         else:
@@ -685,18 +674,30 @@ class AgentRunner:
             debug=self.debug,
             session_id=self.session_id
         )
-        
-        # Set debug flag
+
+        # Set debug flag and route per-interaction files to project .debug
         self.agent.debug = self.debug
+        if self.debug:
+            try:
+                from analysis.debug_logger import DebugLogger as _Dbg
+                dbg_dir = self.project_dir / '.debug'
+                dbg = _Dbg(self.session_id or self.agent.agent_id, output_dir=dbg_dir)
+                # Attach to agent and its LLM clients so all prompts/responses are captured
+                self.agent.debug_logger = dbg
+                if hasattr(self.agent, 'llm') and self.agent.llm:
+                    self.agent.llm.debug_logger = dbg
+                if hasattr(self.agent, 'guidance_client') and self.agent.guidance_client:
+                    self.agent.guidance_client.debug_logger = dbg
+            except Exception:
+                pass
         
         if self.max_iterations:
             self.agent.max_iterations = self.max_iterations
         
         # Initialize plan store and session directory
         try:
-            from analysis.plan_store import PlanStore
+            from analysis.plan_store import PlanStatus, PlanStore
             from analysis.session_manager import SessionManager
-            from analysis.plan_store import PlanStatus
             # Create or find session dir
             sm = SessionManager(self.project_dir)
             if not self.session_id:
@@ -735,12 +736,98 @@ class AgentRunner:
 
         return True
 
+    # ---------------------- Steering Helpers (persistent) ----------------------
+    def _steer_cursor_path(self) -> Path:
+        pdir = self.project_dir or (get_project_dir(self.project_id))
+        return Path(pdir) / '.hound' / 'steering.cursor'
+
+    def _get_last_consumed_steer_ts(self) -> float:
+        try:
+            p = self._steer_cursor_path()
+            if p.exists():
+                v = p.read_text(encoding='utf-8').strip()
+                return float(v or '0')
+        except Exception:
+            return 0.0
+        return 0.0
+
+    def _set_last_consumed_steer_ts(self, ts: float):
+        try:
+            p = self._steer_cursor_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(str(float(ts)), encoding='utf-8')
+        except Exception:
+            pass
+
+    def _read_steering_entries(self, limit: int = 50) -> list:
+        """Read recent steering JSONL entries as list of dicts with {ts, text}.
+        Ignores malformed lines; returns newest-last (chronological) slice.
+        """
+        try:
+            pdir = self.project_dir or get_project_dir(self.project_id)
+            sfile = Path(pdir) / '.hound' / 'steering.jsonl'
+            if not sfile.exists():
+                return []
+            out = []
+            with sfile.open('r', encoding='utf-8', errors='ignore') as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        obj = json.loads(ln)
+                        ts = float(obj.get('ts') or 0.0)
+                        txt = (obj.get('text') or obj.get('message') or obj.get('note') or '').strip()
+                        if txt:
+                            out.append({'ts': ts, 'text': txt})
+                    except Exception:
+                        # fallback for raw lines
+                        out.append({'ts': 0.0, 'text': ln})
+            # Keep only the last N
+            return out[-limit:]
+        except Exception:
+            return []
+
+    def _find_latest_urgent_steer(self) -> dict | None:
+        """Return the newest steering entry interpreted as actionable (urgent),
+        newer than the last consumed timestamp. Treats both explicit verbs and
+        broad/global directives as urgent.
+        """
+        last_ts = self._get_last_consumed_steer_ts()
+        entries = self._read_steering_entries(limit=80)
+        # newest first
+        for ent in reversed(entries):
+            ts = float(ent.get('ts') or 0.0)
+            txt = (ent.get('text') or '').strip()
+            if ts <= last_ts:
+                continue
+            low = txt.lower()
+            # Broaden detection to common phrasing and typos
+            verbs = (
+                'investigate', 'investtgate', 'investigate', 'check', 'look at', 'look into',
+                'focus on', 'analyze', 'audit', 'review', 'examine', 'scan', 'probe', 'dig into',
+                'right now', 'next', 'please investigate', 'please check'
+            )
+            globals = (
+                'whole app', 'entire app', 'entire codebase', 'whole codebase', 'all contracts',
+                'every contract', 'system-wide', 'system wide', 'project-wide', 'project wide',
+                'across the codebase', 'across the repo', 'across modules', 'end-to-end', 'e2e',
+                'globally', 'everywhere', 'full audit', 'full review', 'scan the entire', 'scan all'
+            )
+            if any(k in low for k in verbs) or any(k in low for k in globals):
+                return {'ts': ts, 'text': txt}
+        return None
+
+    def _consume_steer(self, ts: float):
+        if ts and ts > self._get_last_consumed_steer_ts():
+            self._set_last_consumed_steer_ts(ts)
+
     # ---------------------- Dashboard Helpers ----------------------
     def _get_hypotheses_summary(self) -> str:
         """Get a summary of current hypotheses for the Strategist."""
         try:
-            from pathlib import Path as _Path
             import json as _json
+            from pathlib import Path as _Path
             hyp_file = (_Path(self.project_dir) / 'hypotheses.json') if self.project_dir else None
             if hyp_file and hyp_file.exists():
                 data = _json.loads(hyp_file.read_text())
@@ -764,7 +851,7 @@ class AgentRunner:
         except Exception:
             return "Error reading hypotheses"
     
-    def _get_investigation_results_summary(self) -> List[str]:
+    def _get_investigation_results_summary(self) -> list[str]:
         """Get investigation results with findings, not just goals."""
         if not self.session_tracker:
             return list(self.completed_investigations)
@@ -795,8 +882,8 @@ class AgentRunner:
         """Return hypothesis stats from project hypotheses.json."""
         stats = {"total": 0, "confirmed": 0, "rejected": 0, "uncertain": 0}
         try:
-            from pathlib import Path as _Path
             import json as _json
+            from pathlib import Path as _Path
             hyp_file = (_Path(self.project_dir) / 'hypotheses.json') if self.project_dir else None
             if hyp_file and hyp_file.exists():
                 data = _json.loads(hyp_file.read_text())
@@ -913,11 +1000,38 @@ class AgentRunner:
         except Exception as e:
             return f"(error summarizing graphs: {str(e)})"
 
-    def _plan_investigations(self, n: int) -> List[object]:
+    def _plan_investigations(self, n: int) -> list[object]:
         """Plan next investigations using Strategist by default."""
         from types import SimpleNamespace
+        # 0) Optional: honor recent steering as an urgent goal
+        prepared: list[object] = []
+        try:
+            urgent_ent = self._find_latest_urgent_steer()
+            if urgent_ent:
+                urgent = urgent_ent['text']
+                prepared.append(SimpleNamespace(
+                    goal=urgent,
+                    focus_areas=[],
+                    priority=10,
+                    reasoning='User steering: prioritize immediately',
+                    category='suspicion',
+                    expected_impact='high',
+                    frame_id=None
+                ))
+                try:
+                    pub = getattr(self, '_telemetry_publish', None)
+                    if callable(pub):
+                        pub({'type': 'status', 'message': f'steering goal queued: {urgent}'})
+                except Exception:
+                    pass
+                # Mark that we have consumed this steering message
+                try:
+                    self._consume_steer(float(urgent_ent.get('ts') or 0.0))
+                except Exception:
+                    pass
+        except Exception:
+            pass
         # 1) Start with any existing PLANNED items in this session (resume-friendly)
-        prepared: List[object] = []
         existing_frame_ids = set()
         ps = self.plan_store
         try:
@@ -1036,14 +1150,14 @@ class AgentRunner:
 
         class InvestigationItem(BaseModel):
             goal: str = Field(description="Investigation goal or question")
-            focus_areas: List[str] = Field(default_factory=list)
+            focus_areas: list[str] = Field(default_factory=list)
             priority: int = Field(ge=1, le=10, description="1-10, 10 = highest")
             reasoning: str = Field(default="", description="Rationale for why this is promising")
             category: str = Field(default="aspect", description="aspect | suspicion")
             expected_impact: str = Field(default="medium", description="high | medium | low")
 
         class InvestigationPlan(BaseModel):
-            investigations: List[InvestigationItem] = Field(
+            investigations: list[InvestigationItem] = Field(
                 default_factory=list,
                 description=f"List of exactly {n} investigation items to plan"
             )
@@ -1125,7 +1239,7 @@ class AgentRunner:
             # Re-raise the exception to fail the analysis
             raise
 
-    def _render_checklist(self, items: List[object], completed_index: int = -1):
+    def _render_checklist(self, items: list[object], completed_index: int = -1):
         """Render a simple checklist; items up to completed_index are checked."""
         console.print("\n[bold cyan]Investigation Checklist[/bold cyan]")
         for i, it in enumerate(items):
@@ -1140,11 +1254,10 @@ class AgentRunner:
                 meta += f", {cat}"
             console.print(f"  {mark} {it.goal}  ({meta})")
 
-    def _log_planning_status(self, items: List[object], current_index: int = -1):
+    def _log_planning_status(self, items: list[object], current_index: int = -1):
         """Log beautiful planning status and coverage information."""
-        from rich.table import Table
         from rich.box import ROUNDED
-        from rich.panel import Panel
+        from rich.table import Table
         
         # Clear previous output for clean display
         console.print("\n" + "="*80)
@@ -1313,6 +1426,20 @@ class AgentRunner:
             status = info.get('status', '')
             msg = info.get('message', '')
             it = info.get('iteration', 0)
+            # Telemetry publish (best-effort)
+            try:
+                pub = getattr(self, '_telemetry_publish', None)
+                if callable(pub):
+                    pub({
+                        'type': status or 'progress',
+                        'iteration': it,
+                        'message': msg,
+                        'action': info.get('action'),
+                        'parameters': info.get('parameters', {}),
+                        'reasoning': info.get('reasoning', ''),
+                    })
+            except Exception:
+                pass
             
             if status == 'decision':
                 act = info.get('action', '-')
@@ -1327,7 +1454,7 @@ class AgentRunner:
                 
                 # Special formatting for deep_think
                 if act == 'deep_think':
-                    console.print(f"\n[bold magenta]══════ CALLING STRATEGIST MODEL FOR DEEP ANALYSIS ══════[/bold magenta]")
+                    console.print("\n[bold magenta]══════ CALLING STRATEGIST MODEL FOR DEEP ANALYSIS ══════[/bold magenta]")
                     console.print("[yellow]Strategist is analyzing the collected context...[/yellow]")
                 elif params:
                     # Show parameters compactly for non-deep-think actions
@@ -1347,7 +1474,7 @@ class AgentRunner:
                 
                 if action == 'deep_think':
                     if result.get('status') == 'success':
-                        console.print(f"\n[bold green]══════ STRATEGIST ANALYSIS COMPLETE ══════[/bold green]")
+                        console.print("\n[bold green]══════ STRATEGIST ANALYSIS COMPLETE ══════[/bold green]")
                         
                         # Show the strategist's analysis
                         full_response = result.get('full_response', '')
@@ -1388,6 +1515,27 @@ class AgentRunner:
         # Local exception used to abort long-running investigations when time is up
         class _TimeLimitReached(Exception):
             pass
+
+        # Simple steering helpers
+        def _is_global_steer(text: str) -> bool:
+            """Heuristic: detect broad, project-wide directives.
+            Examples: "whole app", "entire codebase", "all contracts", "system-wide", etc.
+            """
+            t = (text or '').lower()
+            if not t:
+                return False
+            global_markers = (
+                'whole app', 'entire app', 'entire codebase', 'whole codebase', 'all contracts',
+                'every contract', 'system-wide', 'system wide', 'project-wide', 'project wide',
+                'across the codebase', 'across the repo', 'across modules', 'end-to-end', 'e2e',
+                'globally', 'everywhere', 'full audit', 'full review', 'scan the entire', 'scan all'
+            )
+            if any(m in t for m in global_markers):
+                return True
+            # Also treat "check X across" as global
+            if ' across ' in t or t.startswith('across '):
+                return True
+            return False
         while True:
             # Time limit check
             if self.time_limit_minutes:
@@ -1399,7 +1547,6 @@ class AgentRunner:
             planned_round += 1
             # Show an animated status while strategist plans the next batch
             try:
-                from rich.status import Status
                 with console.status("[cyan]Strategist planning next steps...[/cyan]", spinner="dots", spinner_style="cyan"):
                     items = self._plan_investigations(max(1, plan_n))
             except Exception:
@@ -1436,6 +1583,35 @@ class AgentRunner:
             executed_frames = set()
             # Execute investigations with proper logging
             for idx, inv in enumerate(items):
+                # Check for mid-batch steering override (preempt current goal once)
+                try:
+                    urgent_ent = self._find_latest_urgent_steer()
+                    urgent = urgent_ent['text'] if urgent_ent else None
+                    if urgent and urgent != self._last_applied_steer and getattr(inv, 'goal', '') != urgent:
+                        console.print(f"[bold yellow]Steering override:[/bold yellow] {urgent}")
+                        try:
+                            pub = getattr(self, '_telemetry_publish', None)
+                            if callable(pub):
+                                pub({'type': 'status', 'message': f'override: {urgent}'})
+                        except Exception:
+                            pass
+                        from types import SimpleNamespace
+                        inv = SimpleNamespace(
+                            goal=urgent,
+                            focus_areas=[],
+                            priority=10,
+                            reasoning='User steering override',
+                            category='suspicion',
+                            expected_impact='high'
+                        )
+                        self._last_applied_steer = urgent
+                        # Mark consumed so it doesn't reapply after restarts
+                        try:
+                            self._consume_steer(float(urgent_ent.get('ts') or 0.0))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 # Check time limit before starting each investigation
                 if self.time_limit_minutes:
                     elapsed_minutes = (time.time() - start_overall) / 60.0
@@ -1488,6 +1664,64 @@ class AgentRunner:
                         status = info.get('status', '')
                         msg = info.get('message', '')
                         it = info.get('iteration', 0)
+                        # Publish telemetry for UI (decision/result/etc.)
+                        try:
+                            pub = getattr(self, '_telemetry_publish', None)
+                            if callable(pub):
+                                payload = {
+                                    'type': status or 'progress',
+                                    'iteration': it,
+                                    'message': msg,
+                                    'action': info.get('action'),
+                                    'parameters': info.get('parameters', {}),
+                                    'reasoning': info.get('reasoning', ''),
+                                }
+                                if status == 'result':
+                                    # Slim down large result fields to keep UI responsive
+                                    res = info.get('result', {}) or {}
+                                    if isinstance(res, dict):
+                                        slim = dict(res)
+                                        # Drop verbose text and heavy fields
+                                        for k in ('graph_display', 'nodes_display', 'full_response', 'graph_data', 'data', 'nodes', 'edges', 'code', 'cards'):
+                                            if k in slim:
+                                                slim.pop(k, None)
+                                        payload['result'] = slim
+                                    else:
+                                        payload['result'] = res
+                                pub(payload)
+                        except Exception:
+                            pass
+
+                        # Mid-investigation steering: if a global directive arrives, request abort
+                        try:
+                            # Only check on meaningful milestones to reduce I/O
+                            if status in {'analyzing', 'decision', 'executing'}:
+                                ent = self._find_latest_urgent_steer()
+                                latest = ent['text'] if ent else None
+                                if latest and latest != self._last_replan_steer:
+                                    if _is_global_steer(latest):
+                                        # Mark and request abort on the agent; outer loop will replan
+                                        self._last_replan_steer = latest
+                                        try:
+                                            if hasattr(self, 'agent') and self.agent:
+                                                self.agent.request_abort(reason=f"steering_replan: {latest[:120]}")  # type: ignore[attr-defined]
+                                        except Exception:
+                                            pass
+                                        # Tell the console and telemetry
+                                        console.print(f"[bold yellow]Steering replan:[/bold yellow] {latest}")
+                                        try:
+                                            pub = getattr(self, '_telemetry_publish', None)
+                                            if callable(pub):
+                                                pub({'type': 'status', 'message': f'steering replan: {latest}'})
+                                        except Exception:
+                                            pass
+                                        # Mark consumed
+                                        try:
+                                            self._consume_steer(float(ent.get('ts') or 0.0))
+                                        except Exception:
+                                            pass
+                        except Exception:
+                            pass
                         if status == 'decision':
                             act = info.get('action', '-')
                             reasoning = info.get('reasoning', '')
@@ -1531,7 +1765,7 @@ class AgentRunner:
                             
                             # Special handling for deep_think
                             if act == 'deep_think':
-                                console.print(f"\n[bold magenta]═══ CALLING STRATEGIST FOR DEEP ANALYSIS ═══[/bold magenta]")
+                                console.print("\n[bold magenta]═══ CALLING STRATEGIST FOR DEEP ANALYSIS ═══[/bold magenta]")
                                 try:
                                     strat_cfg = (self.config or {}).get('models', {}).get('strategist', {})
                                     eff = strat_cfg.get('hypothesize_reasoning_effort') or strat_cfg.get('reasoning_effort')
@@ -1541,7 +1775,7 @@ class AgentRunner:
                                         console.print(f"[dim]Strategist model: {prov}/{mdl} | effort: {eff or 'default'}[/dim]")
                                 except Exception:
                                     pass
-                                console.print(f"[yellow]Strategist is analyzing the collected context...[/yellow]")
+                                console.print("[yellow]Strategist is analyzing the collected context...[/yellow]")
                             
                             # Update agent log
                             self._agent_log.append(f"Iter {it}: {act} - {reasoning[:100] if reasoning else 'no reasoning'}")
@@ -1571,7 +1805,7 @@ class AgentRunner:
                             if action == 'deep_think':
                                 # Special formatting for deep_think results
                                 if result.get('status') == 'success':
-                                    console.print(f"\n[bold green]═══ STRATEGIST ANALYSIS COMPLETE ═══[/bold green]")
+                                    console.print("\n[bold green]═══ STRATEGIST ANALYSIS COMPLETE ═══[/bold green]")
                                     full_response = result.get('full_response', '')
                                     if full_response:
                                         console.print(Panel(full_response, border_style="green", title="Strategist Output"))
@@ -1605,6 +1839,22 @@ class AgentRunner:
                                 # Regular action results
                                 summ = result.get('summary') or result.get('status') or msg
                                 console.print(f"[dim]Result: {summ}[/dim]")
+                                # Publish strategist summary to telemetry for UI when available
+                                try:
+                                    pub = getattr(self, '_telemetry_publish', None)
+                                    if callable(pub) and action == 'deep_think':
+                                        bullets = result.get('guidance_bullets') or []
+                                        hyp_info = result.get('hypotheses_info') or []
+                                        payload = {
+                                            'type': 'strategist',
+                                            'iteration': it,
+                                            'message': 'Strategist analysis complete',
+                                            'bullets': bullets[:5],
+                                            'hypotheses': hyp_info[:5],
+                                        }
+                                        pub(payload)
+                                except Exception:
+                                    pass
                                 # Track cards loaded via load_nodes result if provided
                                 try:
                                     if self.session_tracker and action == 'load_nodes':
@@ -1621,8 +1871,8 @@ class AgentRunner:
                             self._agent_log.append(f"Iter {it} {status}: {msg[:100]}")
 
                     # Show an animated status while the agent thinks/acts for this investigation
+                    replan_requested = False
                     try:
-                        from rich.status import Status
                         with console.status("[cyan]Agent thinking deeply...[/cyan]", spinner="line", spinner_style="cyan"):
                             report = self.agent.investigate(inv.goal, max_iterations=max_iters, progress_callback=_cb)
                     except _TimeLimitReached:
@@ -1637,6 +1887,28 @@ class AgentRunner:
                             console.print(f"\n[yellow]Time limit reached ({self.time_limit_minutes} minutes) — stopping audit[/yellow]")
                             time_up = True
                             break
+                    # If an abort was requested (global steering), skip marking as completed and replan
+                    try:
+                        if hasattr(self, 'agent') and getattr(self.agent, '_abort_requested', False):
+                            # Reset abort flag for next investigation round
+                            try:
+                                self.agent._abort_requested = False  # type: ignore[attr-defined]
+                                self.agent._abort_reason = None      # type: ignore[attr-defined]
+                            except Exception:
+                                pass
+                            console.print("[yellow]Investigation aborted due to steering; reprioritizing...[/yellow]")
+                            # Publish a telemetry status
+                            try:
+                                pub = getattr(self, '_telemetry_publish', None)
+                                if callable(pub):
+                                    pub({'type': 'status', 'message': 'investigation aborted (steering replan)'})
+                            except Exception:
+                                pass
+                            # Do not record as completed; break to re-enter planning
+                            break
+                    except Exception:
+                        pass
+
                     results.append((inv, report))
                     # Track completed investigation
                     self.completed_investigations.append(inv.goal)
@@ -1729,7 +2001,7 @@ class AgentRunner:
         
         # Show final coverage
         coverage_stats = self.session_tracker.get_coverage_stats()
-        console.print(f"\n[bold cyan]Final Coverage Statistics:[/bold cyan]")
+        console.print("\n[bold cyan]Final Coverage Statistics:[/bold cyan]")
         console.print(f"  Nodes visited: {coverage_stats['nodes']['visited']}/{coverage_stats['nodes']['total']} ([cyan]{coverage_stats['nodes']['percent']:.1f}%[/cyan])")
         console.print(f"  Cards analyzed: {coverage_stats['cards']['visited']}/{coverage_stats['cards']['total']} ([cyan]{coverage_stats['cards']['percent']:.1f}%[/cyan])")
         
@@ -1785,10 +2057,13 @@ class AgentRunner:
 @click.option('--session', default=None, help='Attach to a specific session ID')
 @click.option('--new-session', is_flag=True, help='Create a new session')
 @click.option('--session-private-hypotheses', is_flag=True, help='Keep new hypotheses private to this session')
-def agent(project_id: str, iterations: Optional[int], plan_n: int, time_limit: Optional[int], 
-          config: Optional[str], debug: bool, platform: Optional[str], model: Optional[str],
-          strategist_platform: Optional[str], strategist_model: Optional[str],
-          session: Optional[str], new_session: bool, session_private_hypotheses: bool):
+@click.option('--telemetry', is_flag=True, help='Expose local (localhost) telemetry SSE/control and register instance')
+@click.option('--strategist-two-pass', is_flag=True, help='Enable strategist two-pass self-critique to reduce false positives')
+def agent(project_id: str, iterations: int | None, plan_n: int, time_limit: int | None, 
+          config: str | None, debug: bool, platform: str | None, model: str | None,
+          strategist_platform: str | None, strategist_model: str | None,
+          session: str | None, new_session: bool, session_private_hypotheses: bool,
+          telemetry: bool, strategist_two_pass: bool):
     """Run autonomous security analysis agent."""
     
     config_path = Path(config) if config else None
@@ -1798,7 +2073,30 @@ def agent(project_id: str, iterations: Optional[int], plan_n: int, time_limit: O
     if not runner.initialize():
         return
     
+    # Optional telemetry: local-only HTTP SSE/control + instance registry
+    tele = None
     try:
+        if telemetry:
+            try:
+                from telemetry import TelemetryServer
+                # Project dir used after initialize
+                pd = None
+                try:
+                    pd = runner.project_dir if getattr(runner, 'project_dir', None) else None
+                except Exception:
+                    pd = None
+                if pd is None:
+                    # Fall back to resolving when not available
+                    pd = Path(project_id) if Path(project_id).exists() else get_project_dir(project_id)
+                tele = TelemetryServer(str(project_id), Path(pd))
+                tele.start()
+                # Emit a friendly boot event so telemetry streams show activity immediately
+                try:
+                    tele.publish({'type': 'status', 'message': 'audit session started', 'iteration': 0})
+                except Exception:
+                    pass
+            except Exception:
+                tele = None
         # Apply strategist overrides (update config before run if provided)
         if runner.config is None:
             runner.config = {}
@@ -1810,10 +2108,37 @@ def agent(project_id: str, iterations: Optional[int], plan_n: int, time_limit: O
                 runner.config['models']['strategist']['provider'] = strategist_platform
             if strategist_model:
                 runner.config['models']['strategist']['model'] = strategist_model
+        # Apply strategist two-pass toggle if requested
+        try:
+            if strategist_two_pass:
+                runner.config['strategist_two_pass_review'] = True
+        except Exception:
+            pass
         # Set strategist overrides then run
         if session_private_hypotheses and getattr(runner, 'agent', None):
             try:
                 runner.agent.default_hypothesis_visibility = 'session'
+            except Exception:
+                pass
+        # Inject telemetry into runner by monkey-patching a publisher
+        if tele is not None:
+            try:
+                runner._telemetry_publish = tele.publish  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        # Wrap run to emit a start event around each investigation (no per-task completed noise)
+        if tele is not None:
+            # Monkey-patch a simple notifier into runner for per-investigation markers
+            try:
+                _orig_investigate = getattr(runner.agent, 'investigate') if getattr(runner, 'agent', None) else None
+                if callable(_orig_investigate):
+                    def _wrapped_investigate(prompt, *a, **kw):
+                        try:
+                            tele.publish({'type': 'status', 'message': f'starting: {prompt}', 'iteration': (kw.get('iteration') or 0)})
+                        except Exception:
+                            pass
+                        return _orig_investigate(prompt, *a, **kw)
+                    runner.agent.investigate = _wrapped_investigate  # type: ignore[attr-defined]
             except Exception:
                 pass
         runner.run(plan_n=plan_n)
@@ -1822,13 +2147,20 @@ def agent(project_id: str, iterations: Optional[int], plan_n: int, time_limit: O
         # Try to save partial results
         try:
             runner.finalize_tracking('interrupted')
-        except:
+        except Exception:
             pass
     except Exception as e:
         console.print(f"\n[red]Error:[/red] {e}")
         # Try to save partial results
         try:
             runner.finalize_tracking('failed')
-        except:
+        except Exception:
             pass
         raise
+    finally:
+        # Ensure telemetry shutdown and registry cleanup
+        try:
+            if tele is not None:
+                tele.stop()
+        except Exception:
+            pass

@@ -1,15 +1,38 @@
 #!/usr/bin/env python3
 """Hound - AI-powered security analysis system."""
 
-import sys
 import os
-import typer
+import sys
 from pathlib import Path
-from typing import Optional
+
+import typer
 from rich.console import Console
 
-from commands.graph import build, ingest
-from commands.project import ProjectManager
+# Hack for solving conflicts with the global "llm" package
+# TODO: Refactor package imports so we can remove this
+
+_BASE_DIR = Path(__file__).resolve().parent
+_LLM_DIR = _BASE_DIR / "llm"
+_BASE_DIR_STR = str(_BASE_DIR)
+if sys.path[0] != _BASE_DIR_STR:
+    try:
+        sys.path.remove(_BASE_DIR_STR)
+    except ValueError:
+        pass
+    sys.path.insert(0, _BASE_DIR_STR)
+
+try:
+    import types
+    # llm
+    if 'llm' not in sys.modules:
+        m = types.ModuleType('llm')
+        m.__path__ = [str(_LLM_DIR)]  # mark as package namespace
+        sys.modules['llm'] = m
+except Exception:
+    pass
+
+from commands.graph import build  # noqa: E402
+from commands.project import ProjectManager  # noqa: E402
 
 app = typer.Typer(
     name="hound",
@@ -25,6 +48,10 @@ app.add_typer(project_app, name="project")
 # Create agent subcommand group
 agent_app = typer.Typer(help="Run security analysis agents")
 app.add_typer(agent_app, name="agent")
+
+# Create poc subcommand group
+poc_app = typer.Typer(help="Manage proof-of-concept exploits")
+app.add_typer(poc_app, name="poc")
 
 # Helper to invoke Click command functions without noisy tracebacks
 def _invoke_click(cmd_func, params: dict):
@@ -162,6 +189,22 @@ def project_reset_hypotheses(
     from commands.project import reset_hypotheses
     _invoke_click(reset_hypotheses, {'name': name, 'force': force})
 
+@project_app.command("set-hypothesis-status")
+def project_set_hypothesis_status(
+    project_name: str = typer.Argument(..., help="Project name"),
+    hypothesis_id: str = typer.Argument(..., help="Hypothesis ID (can be partial)"),
+    status: str = typer.Argument(..., help="New status: proposed, confirmed, or rejected"),
+    force: bool = typer.Option(False, "--force", "-f", help="Force status change without confirmation")
+):
+    """Set the status of a hypothesis to proposed, confirmed, or rejected."""
+    from commands.project import set_hypothesis_status
+    _invoke_click(set_hypothesis_status, {
+        'project_name': project_name,
+        'hypothesis_id': hypothesis_id,
+        'status': status,
+        'force': force
+    })
+
 # Agent audit subcommand
 @agent_app.command("audit")
 def agent_audit(
@@ -178,11 +221,13 @@ def agent_audit(
     strategist_model: str = typer.Option(None, "--strategist-model", help="Override strategist model (e.g., gpt-4o-mini)"),
     session: str = typer.Option(None, "--session", help="Attach to a specific session ID"),
     new_session: bool = typer.Option(False, "--new-session", help="Create a new session"),
-    session_private_hypotheses: bool = typer.Option(False, "--session-private-hypotheses", help="Keep new hypotheses private to this session")
+    session_private_hypotheses: bool = typer.Option(False, "--session-private-hypotheses", help="Keep new hypotheses private to this session"),
+    telemetry: bool = typer.Option(False, "--telemetry", help="Expose local telemetry SSE/control and register instance"),
+    strategist_two_pass: bool = typer.Option(False, "--strategist-two-pass", help="Enable strategist two-pass self-critique to reduce false positives")
 ):
     """Run autonomous security audit (plans investigations automatically)."""
+
     from commands.agent import agent as agent_command
-    import click
     
     manager = ProjectManager()
     project_id = None
@@ -215,7 +260,7 @@ def agent_audit(
     from random import choice as _choice
     # Light narrative seasoning for audit kickoff with actual model names
     try:
-        from commands.graph import load_config as _load_cfg
+        from utils.config_loader import load_config as _load_cfg
         _cfg = _load_cfg(Path(config)) if config else _load_cfg()
         _models = (_cfg or {}).get('models', {})
         
@@ -263,7 +308,9 @@ def agent_audit(
         'strategist_model': strategist_model,
         'session': session,
         'new_session': new_session,
-        'session_private_hypotheses': session_private_hypotheses
+        'session_private_hypotheses': session_private_hypotheses,
+        'telemetry': telemetry,
+        'strategist_two_pass': strategist_two_pass
     })
 
 
@@ -340,8 +387,6 @@ def graph_build(
     debug: bool = typer.Option(False, "--debug", "-d", help="Enable debug output")
 ):
     """Build system architecture graph from source code."""
-    from commands.graph import build
-    import click
     
     manager = ProjectManager()
     source_path = None
@@ -474,7 +519,7 @@ def graph_add_custom(
         console.print(f"[green]✓ Custom graph created:[/green] {custom_graph_path}")
         
         # Load and show summary
-        with open(custom_graph_path, 'r') as f:
+        with open(custom_graph_path) as f:
             graph_data = json.load(f)
         
         stats = graph_data.get('stats', {})
@@ -483,7 +528,7 @@ def graph_add_custom(
         if stats.get('iterations'):
             console.print(f"  Iterations: {stats['iterations']}")
         
-        console.print(f"\n[cyan]To analyze with this graph, use:[/cyan]")
+        console.print("\n[cyan]To analyze with this graph, use:[/cyan]")
         # Get the actual command used to run this script
         cli_cmd = os.path.basename(sys.argv[0]) if sys.argv else "hound"
         if cli_cmd.endswith('.py'):
@@ -546,9 +591,9 @@ def graph_export(
         if open_browser:
             import webbrowser
             webbrowser.open(f"file://{html_path.resolve()}")
-            console.print(f"[green]✓ Opened in browser[/green]")
+            console.print("[green]✓ Opened in browser[/green]")
         else:
-            console.print(f"\n[bold]Open in browser:[/bold]")
+            console.print("\n[bold]Open in browser:[/bold]")
             console.print(f"  [link]file://{html_path.resolve()}[/link]")
             
             # If on macOS, offer to open in browser
@@ -567,9 +612,10 @@ def graph_reset(
     force: bool = typer.Option(False, "--force", "-f", help="Force reset without confirmation")
 ):
     """Reset all assumptions and observations from project graphs."""
-    from rich.prompt import Confirm
     import json
     import random
+
+    from rich.prompt import Confirm
     
     manager = ProjectManager()
     
@@ -593,7 +639,7 @@ def graph_reset(
     total_assumptions = 0
     for graph_file in graph_files:
         try:
-            with open(graph_file, 'r') as f:
+            with open(graph_file) as f:
                 graph_data = json.load(f)
                 nodes = graph_data.get('nodes', [])
                 for node in nodes:
@@ -618,7 +664,7 @@ def graph_reset(
     reset_count = 0
     for graph_file in graph_files:
         try:
-            with open(graph_file, 'r') as f:
+            with open(graph_file) as f:
                 graph_data = json.load(f)
             
             # Clear annotations from all nodes
@@ -651,14 +697,15 @@ def graph_reset(
 @app.command()
 def finalize(
     project: str = typer.Argument(..., help="Project name"),
-    threshold: float = typer.Option(0.75, "--threshold", "-t", help="Confidence threshold for review"),
+    threshold: float = typer.Option(0.5, "--threshold", "-t", help="Confidence threshold for review"),
     debug: bool = typer.Option(False, "--debug", help="Enable debug mode"),
     platform: str = typer.Option(None, "--platform", help="Override QA platform (e.g., openai, anthropic, mock)"),
     model: str = typer.Option(None, "--model", help="Override QA model (e.g., gpt-4o-mini)")
 ):
     """Finalize hypotheses - review and confirm/reject high-confidence findings."""
-    from commands.finalize import finalize as finalize_command
     import click
+
+    from commands.finalize import finalize as finalize_command
     
     console.print("[bold cyan]Running hypothesis finalization...[/bold cyan]")
     
@@ -667,7 +714,6 @@ def finalize(
     ctx.params = {
         'project_name': project,
         'threshold': threshold,
-        'skip_filter': False,  # Default to not skipping the filter
         'debug': debug,
         'platform': platform,
         'model': model
@@ -685,15 +731,17 @@ def finalize(
 @app.command()
 def report(
     project: str = typer.Argument(..., help="Project name"),
-    output: Optional[str] = typer.Option(None, "--output", "-o", help="Output file path"),
+    output: str | None = typer.Option(None, "--output", "-o", help="Output file path"),
     format: str = typer.Option("html", "--format", "-f", help="Report format (html/markdown)"),
-    title: Optional[str] = typer.Option(None, "--title", "-t", help="Custom report title"),
+    title: str | None = typer.Option(None, "--title", "-t", help="Custom report title"),
     auditors: str = typer.Option("Security Team", "--auditors", "-a", help="Comma-separated auditor names"),
-    debug: bool = typer.Option(False, "--debug", help="Enable debug mode")
+    debug: bool = typer.Option(False, "--debug", help="Enable debug mode"),
+    all: bool = typer.Option(False, "--all", help="Include ALL hypotheses (not just confirmed) - WARNING: No QA performed, may contain false positives")
 ):
     """Generate a professional security audit report."""
-    from commands.report import report as report_command
     import click
+
+    from commands.report import report as report_command
     
     console.print("[bold cyan]Generating security audit report...[/bold cyan]")
     
@@ -706,13 +754,60 @@ def report(
         'title': title,
         'auditors': auditors,
         'debug': debug,
-        'show_prompt': False  # Add missing parameter
+        'show_prompt': False,  # Add missing parameter
+        'include_all': all  # Pass the --all flag as include_all
     }
     
     try:
         report_command.invoke(ctx)
-    except click.Exit as e:
+    except click.exceptions.Exit as e:
         raise typer.Exit(e.exit_code)
+    except SystemExit as e:
+        raise typer.Exit(e.code if hasattr(e, 'code') else 1)
+
+
+@poc_app.command("make-prompt")
+def poc_make_prompt(
+    project: str = typer.Argument(..., help="Project name"),
+    hypothesis: str | None = typer.Option(None, "--hypothesis", "-h", help="Specific hypothesis ID to generate PoC for"),
+    debug: bool = typer.Option(False, "--debug", help="Enable debug mode")
+):
+    """Generate proof-of-concept prompts for confirmed vulnerabilities."""
+    from commands.poc import make_prompt
+    
+    console.print("[bold cyan]Generating PoC prompts...[/bold cyan]")
+    
+    # Load config
+    from utils.config_loader import load_config
+    config = load_config()
+    
+    # Run make-prompt command
+    make_prompt(project, hypothesis, config)
+
+@poc_app.command("import")
+def poc_import(
+    project: str = typer.Argument(..., help="Project name"),
+    hypothesis: str = typer.Argument(..., help="Hypothesis ID to import PoC for"),
+    files: list[str] = typer.Argument(..., help="Files to import as PoC"),
+    description: str | None = typer.Option(None, "--description", "-d", help="Description of the PoC files")
+):
+    """Import proof-of-concept files for a hypothesis."""
+    from commands.poc import import_poc
+    
+    console.print(f"[bold cyan]Importing {len(files)} file(s) for hypothesis {hypothesis}...[/bold cyan]")
+    
+    # Run import command
+    import_poc(project, hypothesis, files, description)
+
+@poc_app.command("list")
+def poc_list(
+    project: str = typer.Argument(..., help="Project name")
+):
+    """List all imported PoCs for a project."""
+    from commands.poc import list_pocs
+    
+    # Run list command
+    list_pocs(project)
 
 
 @app.command()

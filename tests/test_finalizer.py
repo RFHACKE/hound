@@ -2,10 +2,10 @@
 Tests for Finalizer class to ensure full file inclusion and JSON parsing.
 """
 
-import unittest
-import tempfile
-import shutil
 import json
+import shutil
+import tempfile
+import unittest
 from pathlib import Path
 
 from analysis.finalization import Finalizer
@@ -14,7 +14,7 @@ from analysis.finalization import Finalizer
 class DummyLLM:
     def __init__(self, json_payload):
         self._payload = json_payload
-    def raw(self, *, system: str, user: str) -> str:
+    def raw(self, *, system: str, user: str, reasoning_effort=None) -> str:
         # Return as fenced json to test parser
         return f"```json\n{json.dumps(self._payload)}\n```"
 
@@ -42,7 +42,7 @@ class TestFinalizer(unittest.TestCase):
 
     def test_finalize_confirms_and_reads_full_files(self):
         # Prepare finalizer with dummy llm confirming
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import MagicMock, patch
         with patch('llm.unified_client.UnifiedLLMClient') as MockLLM:
             MockLLM.return_value = MagicMock()
             fin = Finalizer(

@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """Dynamic Knowledge Graph Builder with agent-driven schema discovery."""
 
-import json
 import hashlib
+import json
 import sys
-from pathlib import Path
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, asdict, field
 import time
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from pydantic import AliasChoices, BaseModel, Field
+
 from llm.client import LLMClient
-from pydantic import BaseModel, Field
+from llm.tokenization import count_tokens
 
 
 @dataclass
@@ -22,19 +25,19 @@ class DynamicNode:
     id: str
     type: str  # Dynamic type decided by agent
     label: str
-    properties: Dict[str, Any] = field(default_factory=dict)
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    properties: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
     
     # Optional structured fields
-    description: Optional[str] = None
+    description: str | None = None
     confidence: float = 1.0
-    source_refs: List[str] = field(default_factory=list)  # File paths or card IDs
+    source_refs: list[str] = field(default_factory=list)  # File paths or card IDs
     created_by: str = "agent"  # Which agent/pass created this
     iteration: int = 0  # When in the process it was created
     
     # Analysis fields - facts about the system (NOT security issues)
-    observations: List[Dict[str, Any]] = field(default_factory=list)  # Verified facts, invariants, behaviors
-    assumptions: List[Dict[str, Any]] = field(default_factory=list)  # Unverified assumptions, constraints
+    observations: list[dict[str, Any]] = field(default_factory=list)  # Verified facts, invariants, behaviors
+    assumptions: list[dict[str, Any]] = field(default_factory=list)  # Unverified assumptions, constraints
 
 
 @dataclass
@@ -44,12 +47,12 @@ class DynamicEdge:
     type: str  # Dynamic type decided by agent
     source_id: str
     target_id: str
-    properties: Dict[str, Any] = field(default_factory=dict)
+    properties: dict[str, Any] = field(default_factory=dict)
     
     # Optional structured fields
-    label: Optional[str] = None
+    label: str | None = None
     confidence: float = 1.0
-    evidence: List[str] = field(default_factory=list)  # Supporting evidence
+    evidence: list[str] = field(default_factory=list)  # Supporting evidence
     created_by: str = "agent"
     iteration: int = 0
 
@@ -59,17 +62,44 @@ class KnowledgeGraph:
     """A single knowledge graph with a specific focus"""
     name: str
     focus: str  # What this graph focuses on (structure, security, data flow, etc.)
-    nodes: Dict[str, DynamicNode] = field(default_factory=dict)
-    edges: Dict[str, DynamicEdge] = field(default_factory=dict)
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    nodes: dict[str, DynamicNode] = field(default_factory=dict)
+    edges: dict[str, DynamicEdge] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
     
-    def add_node(self, node: DynamicNode):
+    def add_node(self, node: DynamicNode) -> bool:
+        """Add a node. Returns True if node was actually added (not duplicate)."""
+        if node.id in self.nodes:
+            # Node already exists, merge source_refs if provided
+            existing_node = self.nodes[node.id]
+            if node.source_refs:
+                existing_refs = set(existing_node.source_refs)
+                existing_refs.update(node.source_refs)
+                existing_node.source_refs = list(existing_refs)
+            return False
         self.nodes[node.id] = node
+        return True
     
-    def add_edge(self, edge: DynamicEdge):
+    def add_edge(self, edge: DynamicEdge) -> bool:
+        """Add an edge. Returns True if edge was actually added (not duplicate)."""
+        # Check for duplicate edges (same source, target, and type)
+        for existing_edge in self.edges.values():
+            if (existing_edge.source_id == edge.source_id and 
+                existing_edge.target_id == edge.target_id and 
+                existing_edge.type == edge.type):
+                # Edge already exists, merge evidence if provided
+                if hasattr(edge, 'evidence') and edge.evidence:
+                    if hasattr(existing_edge, 'evidence'):
+                        # Merge evidence lists, avoiding duplicates
+                        existing_evidence = set(existing_edge.evidence)
+                        existing_evidence.update(edge.evidence)
+                        existing_edge.evidence = list(existing_evidence)
+                return False  # Skip adding duplicate edge
+        
+        # No duplicate found, add the edge
         self.edges[edge.id] = edge
+        return True
     
-    def get_neighbors(self, node_id: str, edge_type: Optional[str] = None) -> List[str]:
+    def get_neighbors(self, node_id: str, edge_type: str | None = None) -> list[str]:
         """Get neighboring nodes, optionally filtered by edge type"""
         neighbors = []
         for edge in self.edges.values():
@@ -93,15 +123,15 @@ class GraphSpec(BaseModel):
 class GraphDiscovery(BaseModel):
     """Initial discovery of what graphs to build"""
     model_config = {"extra": "forbid"}
-    graphs_needed: List[GraphSpec] = Field(
+    graphs_needed: list[GraphSpec] = Field(
         default_factory=list,
         description="List of graphs to create"
     )
-    suggested_node_types: List[str] = Field(
+    suggested_node_types: list[str] = Field(
         default_factory=list,
         description="Custom node types needed for this codebase"
     )
-    suggested_edge_types: List[str] = Field(
+    suggested_edge_types: list[str] = Field(
         default_factory=list,
         description="Custom edge types needed for this codebase"
     )
@@ -115,7 +145,7 @@ class Observation(BaseModel):
     description: str = Field(description="Description of the observation")
     type: str = Field(default="general", description="Type: invariant, behavior, pattern, constraint, property")
     confidence: float = Field(1.0, description="Confidence in this observation")
-    evidence: List[str] = Field(default_factory=list, description="Evidence supporting this observation")
+    evidence: list[str] = Field(default_factory=list, description="Evidence supporting this observation")
 
 
 class Assumption(BaseModel):
@@ -133,28 +163,42 @@ class NodeSpec(BaseModel):
     id: str = Field(description="Unique node identifier (e.g., 'func_calculate', 'module_utils')")
     type: str = Field(description="Node type (e.g., function, class, module)")
     label: str = Field(description="Human-readable label for the node")
-    refs: List[str] = Field(default_factory=list, description="List of card IDs where this node appears")
+    refs: list[str] = Field(
+        default_factory=list,
+        description="List of card IDs where this node appears",
+        validation_alias=AliasChoices("refs", "Refs", "evidence", "cards"),
+    )
 
 
 class EdgeSpec(BaseModel):
     """Edge to add - connects two nodes"""
     model_config = {"extra": "forbid"}
     type: str = Field(description="Edge type (e.g., calls, uses, depends_on)")
-    src: str = Field(description="Source node ID (must be an existing node ID, NOT a card ID)")
-    dst: str = Field(description="Target node ID (must be an existing node ID, NOT a card ID)")
-    refs: List[str] = Field(default_factory=list, description="Card IDs that evidence this edge")
+    src: str = Field(
+        description="Source node ID (must be an existing node ID, NOT a card ID)",
+        validation_alias=AliasChoices("src", "source", "from", "source_id"),
+    )
+    dst: str = Field(
+        description="Target node ID (must be an existing node ID, NOT a card ID)",
+        validation_alias=AliasChoices("dst", "target", "to", "target_id"),
+    )
+    refs: list[str] = Field(
+        default_factory=list,
+        description="Card IDs that evidence this edge",
+        validation_alias=AliasChoices("refs", "Refs", "evidence", "cards"),
+    )
 
 
 class NodeUpdate(BaseModel):
     """Update for an existing node"""
     model_config = {"extra": "forbid"}
     id: str = Field(description="Node ID to update")
-    description: Optional[str] = Field(None, description="New description")
-    properties: Optional[str] = Field(None, description="JSON string of properties to update")
+    description: str | None = Field(None, description="New description")
+    properties: str | None = Field(None, description="JSON string of properties to update")
     
     # New observations/assumptions to add
-    new_observations: List[Observation] = Field(default_factory=list, description="[LEAVE EMPTY during graph building - only for agent analysis phase]")
-    new_assumptions: List[Assumption] = Field(default_factory=list, description="[LEAVE EMPTY during graph building - only for agent analysis phase]")
+    new_observations: list[Observation] = Field(default_factory=list, description="[LEAVE EMPTY during graph building - only for agent analysis phase]")
+    new_assumptions: list[Assumption] = Field(default_factory=list, description="[LEAVE EMPTY during graph building - only for agent analysis phase]")
 
 
 class GraphUpdate(BaseModel):
@@ -162,16 +206,16 @@ class GraphUpdate(BaseModel):
     model_config = {"extra": "forbid"}
     target_graph: str = Field(default="", description="Name of graph to update")
     
-    new_nodes: List[NodeSpec] = Field(
+    new_nodes: list[NodeSpec] = Field(
         default_factory=list,
         description="New nodes to add - return empty list if no new nodes found"
     )
-    new_edges: List[EdgeSpec] = Field(
+    new_edges: list[EdgeSpec] = Field(
         default_factory=list,
         description="New edges to add - return empty list if no new edges found"
     )
     
-    node_updates: List[NodeUpdate] = Field(
+    node_updates: list[NodeUpdate] = Field(
         default_factory=list,
         description="Updates to existing nodes with new invariants/observations"
     )
@@ -191,33 +235,37 @@ class GraphBuilder:
     4. Minimal pre-processing - just code cards
     """
     
-    def __init__(self, config: Dict, debug: bool = False):
+    def __init__(self, config: dict, debug: bool = False, debug_logger=None):
         self.config = config
         self.debug = debug
+        self.debug_logger = debug_logger
         
         # Initialize LLM clients - guidance for discovery, graph for building
         # Graph model for building graphs
-        self.llm = LLMClient(config, profile="graph")
+        self.llm = LLMClient(config, profile="graph", debug_logger=debug_logger)
         if debug:
             graph_model = config.get("models", {}).get("graph", {}).get("model", "unknown")
             print(f"[*] Graph model: {graph_model}")
         
-        # Guidance model for initial discovery (heavier reasoning)
-        self.llm_agent = LLMClient(config, profile="guidance")
+        # Strategist model for initial discovery (heavier reasoning)
+        self.llm_agent = LLMClient(config, profile="strategist", debug_logger=debug_logger)
         if debug:
-            agent_model = config.get("models", {}).get("guidance", {}).get("model", "unknown")
+            agent_model = config.get("models", {}).get("strategist", {}).get("model", "unknown")
             print(f"[*] Agent model: {agent_model} (for discovery)")
         
         # Knowledge graphs storage
-        self.graphs: Dict[str, KnowledgeGraph] = {}
+        self.graphs: dict[str, KnowledgeGraph] = {}
         
         # Card storage for later retrieval
-        self.card_store: Dict[str, Dict] = {}
+        self.card_store: dict[str, dict] = {}
         
         # Iteration counter
         self.iteration = 0
         # External progress sink
         self._progress_callback = None
+        
+        # Repository root for extracting full content
+        self._repo_root: Path | None = None
 
     def _emit(self, status: str, message: str, **kwargs):
         """Emit progress events to callback and optionally print when debug."""
@@ -241,11 +289,11 @@ class GraphBuilder:
         manifest_dir: Path,
         output_dir: Path,
         max_iterations: int = 5,
-        focus_areas: Optional[List[str]] = None,
+        focus_areas: list[str] | None = None,
         max_graphs: int = 2,
-        force_graphs: Optional[List[Dict[str, str]]] = None,
-        progress_callback: Optional[callable] = None
-    ) -> Dict[str, Any]:
+        force_graphs: list[dict[str, str]] | None = None,
+        progress_callback: Callable[[dict], None] | None = None
+    ) -> dict[str, Any]:
         """
         Main entry point for dynamic graph building.
         
@@ -260,14 +308,14 @@ class GraphBuilder:
         start_time = time.time()
         self._progress_callback = progress_callback
         
-        # Load code cards (minimal preprocessing)
+        # Load code cards with full content
         manifest, cards = self._load_manifest(manifest_dir)
         
         # Calculate statistics
-        total_chars = sum(len(card.get("content", "")) + 
-                         len(card.get("peek_head", "")) + 
-                         len(card.get("peek_tail", "")) 
-                         for card in cards)
+        total_chars = sum(
+            len(card.get("content", "")) if card.get("content") else
+            (len(card.get("peek_head", "")) + len(card.get("peek_tail", "")))
+            for card in cards)
         # Estimate lines from peek content
         total_lines = sum(
             card.get("peek_head", "").count('\n') + 
@@ -295,8 +343,15 @@ class GraphBuilder:
                 print(f"  Iteration {i+1}/{max_iterations}")
             self._emit("building", f"Building graphs: iteration {i+1}/{max_iterations}")
             
-            # Build/refine graphs (no early stopping)
-            self._build_iteration(cards)
+            # Build/refine graphs with early stopping if complete
+            had_updates = self._build_iteration(cards)
+            
+            # Early exit if no graphs were updated (all complete)
+            if not had_updates and i > 0:  # Allow at least 2 iterations
+                self._emit("early_exit", f"All graphs complete after {i+1} iterations")
+                if self.debug:
+                    print(f"  Early exit: All graphs complete after {i+1} iterations")
+                break
         
         # Phase 3: Save results
         self._emit("phase", "Saving Results")
@@ -309,11 +364,11 @@ class GraphBuilder:
     
     def _discover_graphs(
         self,
-        manifest: Dict,
-        cards: List[Dict],
-        focus_areas: Optional[List[str]] = None,
+        manifest: dict,
+        cards: list[dict],
+        focus_areas: list[str] | None = None,
         max_graphs: int = 2,
-        force_graphs: Optional[List[Dict[str, str]]] = None
+        force_graphs: list[dict[str, str]] | None = None
     ):
         """Let agent discover what graphs to build"""
         
@@ -331,10 +386,10 @@ class GraphBuilder:
                 self._emit("graph", f"Created graph: {graph_spec['name']} (focus: {focus})")
             return
         
-        # Use adaptive sampling based on content size, not count
+        # Use adaptive sampling based on token count for discovery phase
         self._emit("discover", "Analyzing codebase for graph discovery...")
-        # Auto-sample based on content size to stay within context limits
-        code_samples = self._sample_cards(cards, target_size_mb=2.0)
+        # Sample cards to stay within STRATEGIST model's context limits (not graph model's)
+        code_samples = self._sample_cards_for_discovery(cards)
         
         # Allow forcing specific graph type through focus_areas (backward compatibility)
         if focus_areas and "call_graph" in focus_areas:
@@ -353,19 +408,36 @@ REQUIRED: The FIRST graph MUST be a high-level system/component/flow graph that 
 
 Name it "SystemArchitecture".
 
-{'For additional graphs, choose what would be most useful for understanding the system architecture and relationships in this codebase.' if max_graphs > 1 else ''}
+DIVERSITY REQUIREMENTS (for remaining graphs):
+- Each additional graph MUST present a distinct analytical lens (do NOT create multiple call graphs).
+- Prefer domain-relevant structures with meaningful, typed relationships (edges with types like grants, authorizes, mints, reads, writes, depends_on, initializes, upgrades, pauses, emits, computes, bounded_by, etc.).
+- Choose graphs that maximize utility for security analysis and understanding, not just topology.
 
-{'Examples of other useful graphs:' if max_graphs > 1 else ''}
-{'''- Call graph: function calls
-- Authorization / action map
-- Data flow graph
-- State mutation graph
-- User flows and evens
-- Asset/monetary flows (for smart contract projects)''' if max_graphs > 1 else ''}
+Creativity guidance:
+- Be maximally creative and tailor graph types to THIS codebase (examples are inspiration, not constraints).
+- Propose novel, domain-specific graph types when they would reveal important structure or risk.
+- Avoid redundancy across graphs; minimize overlap and pick the most informative lenses.
+
+Ideas for strong, analysis-friendly graphs (pick those that fit this codebase):
+- AuthorizationMap: who grants/assumes/authorizes which roles/actions (edges: creates, grants, assumes, authorizes, guarded_by).
+- PermissionChecks: coverage of access modifiers and require checks per function (edges: guarded_by, unchecked, requires_role).
+- AssetFlow: mint/burn/transfer/deposit/withdraw across contracts and accounts (edges: mints, burns, transfers, deposits, withdraws).
+- StateMutation: storage variables and the functions that read/write them (edges: written_by, read_by, derived_from).
+- UpgradeLifecycle: deployment/initialization/upgrade relationships (edges: deploys, initializes, upgrades, migrates_from).
+- ExternalDeps: external/oracle/library dependencies and trust boundaries (edges: reads_from, depends_on, trusts, verifies).
+- Reentrancy/ExternalCalls: external call graph with entrypoints and reentrant paths (edges: calls_external, reentrant_path, invokes_untrusted).
+- InvariantsMap: key invariants/assumptions and where they’re enforced (edges: enforced_by, broken_by, relies_on).
+- MathAlgorithm: break down core formulas/AMM math into steps/variables (edges: computes, uses_param, normalizes, clamps).
+- EventMap: which events are emitted by which functions and with what state (edges: emitted_by, indexes, correlates_with).
+- TimeWindows/RateLimits: time-based gates and limits (edges: gates, bounded_by, cooldown).
 
 For each graph, you MUST provide:
 - name: A short name for the graph
 - focus: What this graph focuses on (be specific)
+
+Additionally, provide top-level guidance to help refinement:
+- suggested_node_types: list of node types you plan to use across graphs (e.g., function, storage, role, token, invariant, event)
+- suggested_edge_types: list of edge types you plan to use (e.g., calls, guarded_by, writes, reads, mints, authorizes)
 
 IMPORTANT: Return EXACTLY {max_graphs} graph{'s' if max_graphs > 1 else ''}, no more, no less.
 The FIRST must be the system/component/flow overview."""
@@ -378,12 +450,30 @@ The FIRST must be the system/component/flow overview."""
             "instruction": "Determine what knowledge graphs to build and what custom types are needed"
         }
         
+        # Estimate token counts for the request
+        user_prompt_str = json.dumps(user_prompt, indent=2)
+        system_tokens = count_tokens(system_prompt, "openai", self.config.get("llm_agent_model", "gpt-5-mini"))
+        user_tokens = count_tokens(user_prompt_str, "openai", self.config.get("llm_agent_model", "gpt-5-mini"))
+        total_tokens = system_tokens + user_tokens
+        
+        # Log token counts
+        self._emit("debug", f"Initial graph design prompt tokens: system={system_tokens:,}, user={user_tokens:,}, total={total_tokens:,}")
+        
+        # Check if we're approaching context limit for strategist/discovery model
+        strategist_model_config = self.config.get("models", {}).get("strategist", {})
+        strategist_max_context = strategist_model_config.get("max_context", 400000)  # Default 400k for discovery
+        if total_tokens > strategist_max_context * 0.9:
+            self._emit("warning", f"Token count ({total_tokens:,}) approaching context limit ({strategist_max_context:,})")
+        
         # Use agent model for discovery (better reasoning)
         discovery = self.llm_agent.parse(
             system=system_prompt,
-            user=json.dumps(user_prompt, indent=2),
+            user=user_prompt_str,
             schema=GraphDiscovery
         )
+        
+        # Store discovery for later reference in prompts
+        self._discovery = discovery
         
         # Create the suggested graphs (limited to max_graphs)
         graphs_to_create = discovery.graphs_needed[:max_graphs]
@@ -415,11 +505,13 @@ The FIRST must be the system/component/flow overview."""
         if discovery.suggested_edge_types:
             self._emit("note", f"Custom edge types: {', '.join(discovery.suggested_edge_types)}")
     
-    def _build_iteration(self, cards: List[Dict]):
+    def _build_iteration(self, cards: list[dict]) -> bool:
         """
         Single iteration to build/refine graphs.
-        Continues through all iterations without early stopping.
+        Returns True if any graph was updated, False if all graphs are complete.
         """
+        
+        any_updates = False
         
         # Always try to use ALL cards for maximum context
         # The model needs to see the entire codebase to make good decisions
@@ -427,25 +519,32 @@ The FIRST must be the system/component/flow overview."""
             orphan_count = len(self._get_orphaned_nodes(graph))
             self._emit("graph_build", f"{graph_name}: {len(graph.nodes)}N/{len(graph.edges)}E, {orphan_count} orphans")
             
-            # Use adaptive sampling based on content size to respect context limits
-            relevant_cards = self._sample_cards(cards, target_size_mb=2.0)
+            # Try to use ALL cards if possible within token limits
+            relevant_cards = self._sample_cards(cards)
             if len(relevant_cards) != len(cards):
-                self._emit("sample", f"Sampled {len(relevant_cards)} cards from {len(cards)} total for context limits")
+                self._emit(
+                    "sample",
+                    f"Sampled {len(relevant_cards)} of {len(cards)} cards to fit context; for large codebases consider increasing iterations or using a graph model with a larger context size."
+                )
             
             # Update the graph
             update = self._update_graph(graph, relevant_cards)
             
             if update:
-                # Apply whatever updates were found (could be empty lists)
-                added_nodes = len(update.new_nodes)
-                added_edges = len(update.new_edges)
-                self._apply_update(graph, update)
+                # Apply updates and track what was actually added (deduplication happens in add_node/add_edge)
+                nodes_added, edges_added = self._apply_update(graph, update)
                 
                 new_orphan_count = len(self._get_orphaned_nodes(graph))
-                if added_nodes > 0 or added_edges > 0:
-                    self._emit("update", f"Added: {added_nodes} nodes, {added_edges} edges (orphans {orphan_count}->{new_orphan_count})")
+                if nodes_added > 0 or edges_added > 0:
+                    self._emit("update", f"Added: {nodes_added} nodes, {edges_added} edges (orphans {orphan_count}->{new_orphan_count})")
+                    any_updates = True
                 else:
-                    self._emit("update", f"No new nodes/edges (orphans: {new_orphan_count})")
+                    self._emit("update", f"No new nodes/edges added (duplicates filtered, orphans: {new_orphan_count})")
+                    # If no new nodes or edges were added, the graph might be complete
+                    if self.iteration > 0:  # Only after first iteration
+                        self._emit("complete", f"Graph '{graph_name}' appears complete (no new nodes/edges found)")
+        
+        return any_updates
     
     def _get_orphaned_nodes(self, graph: KnowledgeGraph) -> set:
         """Find nodes with no edges (neither incoming nor outgoing)"""
@@ -457,23 +556,41 @@ The FIRST must be the system/component/flow overview."""
         orphaned = set(graph.nodes.keys()) - connected_nodes
         return orphaned
     
-    def _update_graph(self, graph: KnowledgeGraph, cards: List[Dict]) -> Optional[GraphUpdate]:
+    def _update_graph(self, graph: KnowledgeGraph, cards: list[dict]) -> GraphUpdate | None:
         """Update graph with new nodes and edges based on current state"""
         
-        # Store cards for later retrieval
+        # Store cards for later retrieval - filter out redundant peek fields
         cards_with_ids = []
         for card in cards:
             card_id = card.get("id", f"card_{len(self.card_store)}_{len(cards_with_ids)}")
             self.card_store[card_id] = card
-            card_with_id = dict(card)
-            card_with_id["id"] = card_id
+            # Create a filtered version without peek_head/peek_tail for the prompt
+            card_with_id = {
+                "id": card_id,
+                "relpath": card.get("relpath", ""),
+                "content": card.get("content", "")
+            }
+            # Only include other fields if they exist and are meaningful
+            if card.get("type"):
+                card_with_id["type"] = card["type"]
+            if card.get("description"):
+                card_with_id["description"] = card["description"]
             cards_with_ids.append(card_with_id)
         
         # Adaptive prompting based on graph state
         if self.iteration == 0:
             # Initial build - focus on discovering CONNECTED nodes
-            system_prompt = f"""Build {graph.focus} graph.
-FOCUS: Find core nodes AND their connections at fine granularity.
+            # Include suggested types in prompt if available
+            type_guidance = ""
+            if hasattr(self, '_discovery') and self._discovery:
+                if self._discovery.suggested_node_types:
+                    type_guidance += f"\n\nRECOMMENDED NODE TYPES (use these!):\n{', '.join(self._discovery.suggested_node_types[:15])}"
+                if self._discovery.suggested_edge_types:
+                    type_guidance += f"\n\nRECOMMENDED EDGE TYPES (use these!):\n{', '.join(self._discovery.suggested_edge_types[:15])}"
+            
+            system_prompt = f"""Build {graph.focus} graph.{type_guidance}
+FOCUS: COMPREHENSIVELY model ALL aspects of this graph's focus.
+You MUST capture the COMPLETE structure - don't leave anything out!
 
 IMPORTANT: This is ONLY structural discovery - do NOT add observations or assumptions.
 Those will be added later during analysis.
@@ -490,6 +607,8 @@ Nodes: id (unique string), type, label, refs (array of card IDs that contain thi
   - MUST be defined in the project's source files (not just imported/used)
 Edges: type, src (source NODE ID), dst (target NODE ID), refs (array of card IDs evidencing this relationship)
 
+CRITICAL: Check existing_edges list and DO NOT recreate edges that already exist!
+
 CRITICAL - refs field:
 - Each node MUST have a refs array containing the IDs of cards where this node appears
 - Each edge SHOULD have a refs array with card IDs where this relationship is visible (call site, data flow, state mutation)
@@ -501,7 +620,8 @@ IMPORTANT:
 - Edge src/dst must reference node IDs you created, NOT card IDs!
 - Every node should have at least one edge (incoming or outgoing)
 - Prioritize connected components over isolated nodes
-Target: 15-25 nodes with strong connectivity."""
+Target: 20-40 nodes minimum (more if needed for completeness). Every significant component should be represented.
+Prioritize COMPLETENESS over simplicity - it's better to have too many nodes than to miss important parts."""
         else:
             # Refinement - strongly prioritize connecting existing nodes
             orphaned_nodes = self._get_orphaned_nodes(graph)
@@ -510,14 +630,29 @@ Target: 15-25 nodes with strong connectivity."""
             if orphan_count > 5:
                 # Many orphaned nodes - focus on connecting them
                 orphan_sample = list(orphaned_nodes)[:10]  # Show first 10
-                focus_instruction = f"CRITICAL: {orphan_count} nodes have NO connections! Connect these orphans: {orphan_sample}"
-            elif len(graph.edges) < len(graph.nodes):
-                focus_instruction = f"PRIORITY: Find EDGES for existing {len(graph.nodes)} nodes. Each node needs connections!"
+                focus_instruction = f"CRITICAL: {orphan_count} nodes have NO connections! Connect these orphans: {orphan_sample}\nEvery node should have at least one edge!"
+            elif len(graph.edges) < len(graph.nodes) * 1.5:
+                focus_instruction = f"PRIORITY: Find MORE EDGES! With {len(graph.nodes)} nodes, you should have at least {int(len(graph.nodes) * 1.5)} edges. Look for all relationships!"
             else:
-                focus_instruction = "Balance nodes and edges. Ensure all nodes are connected."
+                focus_instruction = "Continue adding nodes and edges to ensure COMPLETE coverage. Look for any missing components or relationships."
+            
+            # Include type guidance in refinement too
+            type_guidance = ""
+            if hasattr(self, '_discovery') and self._discovery:
+                if self._discovery.suggested_node_types:
+                    unused_node_types = [t for t in self._discovery.suggested_node_types if not any(n.type == t for n in graph.nodes.values())]
+                    if unused_node_types:
+                        type_guidance += f"\n\nUNUSED NODE TYPES (consider using): {', '.join(unused_node_types[:10])}"
+                if self._discovery.suggested_edge_types:
+                    unused_edge_types = [t for t in self._discovery.suggested_edge_types if not any(e.type == t for e in graph.edges.values())]
+                    if unused_edge_types:
+                        type_guidance += f"\n\nUNUSED EDGE TYPES (consider using): {', '.join(unused_edge_types[:10])}"
             
             system_prompt = f"""Refine {graph.focus}. Current: {len(graph.nodes)}N/{len(graph.edges)}E, {orphan_count} orphans.
 {focus_instruction}
+
+GOAL: Create a COMPREHENSIVE model that captures ALL aspects of {graph.focus}.
+The graph should be COMPLETE - every important component, relationship, and interaction should be represented.{type_guidance}
 
 IMPORTANT: This is ONLY structural discovery - do NOT add observations or assumptions.
 Those will be added later during analysis.
@@ -534,28 +669,41 @@ Nodes: If adding new nodes, include refs array with card IDs where they appear; 
   - MUST be defined in the project's source files (not just imported/used)
 Edges: type, src (existing NODE id), dst (existing NODE id), refs (card IDs evidencing the relationship). 
 IMPORTANT: Use existing node IDs! Check the existing_nodes list.
+CRITICAL: Check existing_edges list and DO NOT recreate edges that already exist!
 For any new nodes, include refs field with card IDs from code_samples.
-Return empty lists only if graph is fully connected."""
+Return empty lists only if graph is TRULY complete and comprehensive."""
         
-        # Build user prompt with existing nodes for reference
+        # Build user prompt with existing nodes AND edges for reference
         existing_nodes_list = []
-        if self.iteration > 0 and len(graph.nodes) > 0:
+        existing_edges_list = []
+        
+        if self.iteration > 0:
             # Provide existing nodes to help model make connections
-            for node_id, node in graph.nodes.items():
-                existing_nodes_list.append({
-                    "id": node_id,
-                    "type": node.type,
-                    "label": node.label
-                })
+            if len(graph.nodes) > 0:
+                for node_id, node in graph.nodes.items():
+                    existing_nodes_list.append({
+                        "id": node_id,
+                        "type": node.type,
+                        "label": node.label
+                    })
+            
+            # Provide existing edges to avoid duplicates
+            if len(graph.edges) > 0:
+                for edge_id, edge in graph.edges.items():
+                    existing_edges_list.append({
+                        "type": edge.type,
+                        "src": edge.source_id,
+                        "dst": edge.target_id
+                    })
         
         user_prompt = {
             "graph_name": graph.name,
             "graph_focus": graph.focus,
             "existing_nodes": existing_nodes_list if existing_nodes_list else f"{len(graph.nodes)} nodes",
-            "existing_edges": len(graph.edges),
+            "existing_edges": existing_edges_list if existing_edges_list else f"{len(graph.edges)} edges",
             "code_samples": cards_with_ids,
             "iteration": self.iteration,
-            "instruction": "Update graph. Use NODE IDs for edges. Include refs arrays for nodes AND edges with card IDs from code_samples that evidence them."
+            "instruction": "Update graph. ONLY add NEW nodes/edges that don't already exist. Check existing_edges to avoid duplicates. Use NODE IDs for edges. Include refs arrays for nodes AND edges with card IDs from code_samples that evidence them."
         }
         
         try:
@@ -567,12 +715,32 @@ Return empty lists only if graph is fully connected."""
             update.target_graph = graph.name
             return update
         except Exception as e:
+            # One-shot retry with stricter output instructions to correct common format issues
             self._emit("warn", f"Failed to get update: {e}")
-            return None
+            strict_suffix = (
+                "\n\nSTRICT OUTPUT RULES:\n"
+                "- Return ONLY a JSON object with keys: new_nodes, new_edges, node_updates.\n"
+                "- Use lowercase keys exactly: refs, src, dst.\n"
+                "- Do NOT include any schema, $defs, comments, or trailing text.\n"
+            )
+            try:
+                update = self.llm.parse(
+                    system=system_prompt + strict_suffix,
+                    user=json.dumps(user_prompt, indent=2),
+                    schema=GraphUpdate,
+                )
+                update.target_graph = graph.name
+                return update
+            except Exception as e2:
+                self._emit("warn", f"Retry failed: {e2}")
+                return None
     
     
-    def _apply_update(self, graph: KnowledgeGraph, update: GraphUpdate):
-        """Apply an update to a graph"""
+    def _apply_update(self, graph: KnowledgeGraph, update: GraphUpdate) -> tuple[int, int]:
+        """Apply an update to a graph. Returns (nodes_added, edges_added)."""
+        
+        nodes_added = 0
+        edges_added = 0
         
         # Add new nodes
         for node_spec in update.new_nodes:
@@ -593,9 +761,10 @@ Return empty lists only if graph is fully connected."""
                 observations=[],
                 assumptions=[]
             )
-            graph.add_node(node)
+            if graph.add_node(node):
+                nodes_added += 1
         
-        # Add new edges
+        # Add new edges (will be deduplicated in add_edge method)
         for edge_spec in update.new_edges:
             edge = DynamicEdge(
                 id=self._generate_id("edge"),
@@ -609,7 +778,8 @@ Return empty lists only if graph is fully connected."""
                 created_by=f"iteration_{self.iteration}",
                 iteration=self.iteration
             )
-            graph.add_edge(edge)
+            if graph.add_edge(edge):
+                edges_added += 1
         
         # Update existing nodes
         for node_update in update.node_updates:
@@ -630,44 +800,121 @@ Return empty lists only if graph is fully connected."""
                 for assum in node_update.new_assumptions:
                     node.assumptions.append(assum.model_dump())
         
-        # Updates complete
+        return nodes_added, edges_added
     
     
-    def _sample_cards(
-        self,
-        cards: List[Dict],
-        target_size_mb: float = 2.0
-    ) -> List[Dict]:
-        """Adaptive sampling based on content size instead of count"""
+    @staticmethod
+    def load_cards_from_manifest(manifest_dir: Path) -> tuple[list[dict], dict]:
+        """
+        Load cards and manifest from a project's manifest directory.
+        Returns: (cards, manifest)
+        """
+        import json
         
-        # Calculate total size of cards
-        total_size = sum(
-            len(card.get("content", "")) + 
-            len(card.get("peek_head", "")) + 
-            len(card.get("peek_tail", ""))
-            for card in cards
-        )
+        if not manifest_dir.exists():
+            raise ValueError(f"No manifest found at {manifest_dir}")
         
-        # Convert MB to bytes
-        size_threshold = int(target_size_mb * 1_000_000)
+        # Load manifest
+        with open(manifest_dir / "manifest.json") as f:
+            manifest = json.load(f)
+        
+        # Load cards
+        cards = []
+        repo_root = None
+        repo_path = manifest.get('repo_path')
+        if repo_path:
+            repo_root = Path(repo_path)
+        
+        from analysis.cards import extract_card_content
+        
+        with open(manifest_dir / "cards.jsonl") as f:
+            for line in f:
+                card = json.loads(line)
+                if not card.get('content') and repo_root:
+                    card['content'] = extract_card_content(card, repo_root)
+                cards.append(card)
+        
+        return cards, manifest
+    
+    def prepare_code_context(self, cards: list[dict]) -> list[dict]:
+        """
+        Prepare code context from cards for LLM prompts.
+        Filters out redundant fields and returns clean context.
+        """
+        code_context = []
+        for card in cards:
+            context_item = {
+                "file": card.get("relpath", "unknown"),
+                "content": card.get("content", "")
+            }
+            # Only include type if it exists
+            if card.get("type"):
+                context_item["type"] = card["type"]
+            code_context.append(context_item)
+        return code_context
+    
+    def sample_cards_for_prompt(self, cards: list[dict]) -> tuple[list[dict], int, int]:
+        """
+        Sample cards for LLM prompt, returning sampled cards and counts.
+        Returns: (sampled_cards, original_count, sampled_count)
+        """
+        original_count = len(cards)
+        sampled_cards = self._sample_cards(cards)
+        return sampled_cards, original_count, len(sampled_cards)
+    
+    def _sample_cards_for_discovery(self, cards: list[dict]) -> list[dict]:
+        """
+        Sample cards specifically for the discovery phase.
+        Uses strategist model's context limit or global default, NOT graph model's limit.
+        """
+        # Get context limit for strategist/discovery model
+        strategist_model_config = self.config.get("models", {}).get("strategist", {})
+        strategist_max_context = strategist_model_config.get("max_context")
+        
+        if strategist_max_context:
+            max_context_tokens = strategist_max_context
+            if self.debug:
+                print(f"      Discovery: Using strategist model's max_context: {max_context_tokens:,} tokens")
+        else:
+            # Fall back to global context limit
+            max_context_tokens = self.config.get("context", {}).get("max_tokens", 256000)
+            if self.debug:
+                print(f"      Discovery: Using global max_context: {max_context_tokens:,} tokens")
+        
+        # Reserve more tokens for discovery (system prompt is larger, needs more response space)
+        reserved_tokens = 50000  # More conservative reservation for discovery
+        available_tokens = max_context_tokens - reserved_tokens
+        target_tokens = int(available_tokens * 0.7)  # More conservative: 70% instead of 80%
+        
+        # Get the strategist model for token counting
+        model = strategist_model_config.get("model", "gpt-5")
+        
+        # Count tokens for all cards
+        total_tokens = 0
+        card_tokens = []
+        for card in cards:
+            card_text = f"{card.get('relpath', '')}\n{card.get('content', '')}"
+            tokens = count_tokens(card_text, "openai", model)
+            card_tokens.append(tokens)
+            total_tokens += tokens
         
         # If under threshold, use all cards
-        if total_size <= size_threshold:
+        if total_tokens <= target_tokens:
             if self.debug:
-                print(f"      Using ALL {len(cards)} cards (total size: {total_size:,} chars < {size_threshold:,} threshold)")
+                usage_pct = (total_tokens * 100) // max_context_tokens
+                print(f"      Discovery: Using ALL {len(cards)} cards ({total_tokens:,} tokens, {usage_pct}% of context)")
             return cards
         
-        # Calculate proportional sample size to stay under threshold
-        ratio = size_threshold / total_size
+        # Need to sample - use same diversity logic
+        ratio = target_tokens / total_tokens
         sample_size = max(1, int(len(cards) * ratio))
         
         if self.debug:
-            print(f"      WARNING: Large codebase - sampling {sample_size} cards from {len(cards)} total (size: {total_size:,} chars > {size_threshold:,} threshold, ratio: {ratio:.3f})")
+            print(f"      Discovery: Sampling {sample_size} cards from {len(cards)} total (tokens: {total_tokens:,} > {target_tokens:,} target)")
         
-        # Use original file diversity sampling logic
         import random
         
-        # Try to sample from different files if possible
+        # Sample with file diversity
         files_to_cards = {}
         for card in cards:
             file_path = card.get("relpath", "unknown")
@@ -675,17 +922,133 @@ Return empty lists only if graph is fully connected."""
                 files_to_cards[file_path] = []
             files_to_cards[file_path].append(card)
         
-        # Sample cards ensuring file diversity
         sampled = []
         files = list(files_to_cards.keys())
         random.shuffle(files)
         
+        # Take cards from different files
+        cards_per_file = max(1, min(3, sample_size // len(files))) if len(files) > 0 else sample_size
+        
         for file_path in files:
             if len(sampled) >= sample_size:
                 break
-            # Take 1-2 cards from each file
             file_cards = files_to_cards[file_path]
-            num_from_file = min(2, len(file_cards), sample_size - len(sampled))
+            num_from_file = min(cards_per_file, len(file_cards), sample_size - len(sampled))
+            sampled.extend(random.sample(file_cards, num_from_file))
+        
+        # Fill remaining if needed
+        if len(sampled) < sample_size:
+            remaining = [c for c in cards if c not in sampled]
+            additional = min(sample_size - len(sampled), len(remaining))
+            if additional > 0:
+                sampled.extend(random.sample(remaining, additional))
+        
+        # Final safety check - verify we're under limit
+        final_tokens = 0
+        for card in sampled:
+            card_text = f"{card.get('relpath', '')}\n{card.get('content', '')}"
+            final_tokens += count_tokens(card_text, "openai", model)
+        
+        # If still over, remove cards until we fit
+        while final_tokens > target_tokens and len(sampled) > 1:
+            # Remove a random card
+            removed_idx = random.randint(0, len(sampled) - 1)
+            removed_card = sampled.pop(removed_idx)
+            removed_text = f"{removed_card.get('relpath', '')}\n{removed_card.get('content', '')}"
+            final_tokens -= count_tokens(removed_text, "openai", model)
+            if self.debug:
+                print(f"      Discovery: Removing card to fit in context (now {final_tokens:,} tokens)")
+        
+        if self.debug:
+            print(f"      Discovery: Final sample: {len(sampled)} cards, {final_tokens:,} tokens (target was {target_tokens:,})")
+        
+        return sampled
+    
+    def _sample_cards(
+        self,
+        cards: list[dict]
+    ) -> list[dict]:
+        """Adaptive sampling based on token count to stay within context limits"""
+        
+        # Get max tokens for graph model specifically, if configured
+        # First check if graph model has its own max_context setting
+        graph_model_config = self.config.get("models", {}).get("graph", {})
+        graph_max_context = graph_model_config.get("max_context")
+        
+        if graph_max_context:
+            # Use graph model's specific context limit
+            max_context_tokens = graph_max_context
+            if self.debug:
+                print(f"      Using graph model's max_context: {max_context_tokens:,} tokens")
+        else:
+            # Fall back to global context limit
+            max_context_tokens = self.config.get("context", {}).get("max_tokens", 256000)
+        
+        # Reserve tokens for system prompt and response (30k should be enough)
+        reserved_tokens = 30000
+        available_tokens = max_context_tokens - reserved_tokens
+        
+        # Target to use 80% of available tokens (more aggressive usage)
+        target_tokens = int(available_tokens * 0.8)
+        
+        # Estimate tokens for all cards (only content and path, no peek fields)
+        total_tokens = 0
+        card_tokens = []
+        # Use the actual graph model for token counting
+        model = graph_model_config.get("model", "gpt-4")
+        
+        for card in cards:
+            # Only count the fields we'll actually send
+            card_text = f"{card.get('relpath', '')}\n{card.get('content', '')}"
+            tokens = count_tokens(card_text, "openai", model)
+            card_tokens.append(tokens)
+            total_tokens += tokens
+        
+        # If under threshold, use all cards
+        if total_tokens <= target_tokens:
+            if self.debug:
+                usage_pct = (total_tokens * 100) // max_context_tokens
+                print(f"      Using ALL {len(cards)} cards (total tokens: {total_tokens:,} < {target_tokens:,} target)")
+                print(f"      Context usage: {usage_pct}% of {max_context_tokens:,} available tokens")
+            return cards
+        
+        # Calculate proportional sample size to stay under token limit
+        ratio = target_tokens / total_tokens
+        sample_size = max(1, int(len(cards) * ratio))
+        
+        if self.debug:
+            print(f"      WARNING: Large codebase - sampling {sample_size} cards from {len(cards)} total (tokens: {total_tokens:,} > {target_tokens:,} target, ratio: {ratio:.3f})")
+        
+        # Use original file diversity sampling logic
+        import random
+        
+        # Sample cards ensuring file diversity - no hardcoded priorities
+        files_to_cards = {}
+        for card in cards:
+            file_path = card.get("relpath", "unknown")
+            if file_path not in files_to_cards:
+                files_to_cards[file_path] = []
+            files_to_cards[file_path].append(card)
+        
+        # Sample cards ensuring we get representation from many files
+        sampled = []
+        files = list(files_to_cards.keys())
+        random.shuffle(files)  # Random order to avoid bias
+        
+        # Calculate cards per file to maximize coverage
+        if len(files) > 0:
+            cards_per_file = max(1, sample_size // len(files))
+            # But cap at 2-3 cards per file to ensure diversity
+            cards_per_file = min(cards_per_file, 3)
+        else:
+            cards_per_file = sample_size
+        
+        for file_path in files:
+            if len(sampled) >= sample_size:
+                break
+            file_cards = files_to_cards[file_path]
+            # Take up to cards_per_file from each file
+            num_from_file = min(cards_per_file, len(file_cards), sample_size - len(sampled))
             sampled.extend(random.sample(file_cards, num_from_file))
         
         # Fill up with random cards if needed
@@ -694,49 +1057,59 @@ Return empty lists only if graph is fully connected."""
             additional = min(sample_size - len(sampled), len(remaining))
             sampled.extend(random.sample(remaining, additional))
         
-        # Verify we're under the size threshold, trim if needed
-        sampled_size = sum(
-            len(card.get("content", "")) + 
-            len(card.get("peek_head", "")) + 
-            len(card.get("peek_tail", ""))
-            for card in sampled
-        )
+        # Verify we're under the token threshold, trim if needed
+        sampled_tokens = 0
+        for card in sampled:
+            card_text = f"{card.get('relpath', '')}\n{card.get('content', '')}"
+            sampled_tokens += count_tokens(card_text, "openai", model)
         
         # If still over threshold, remove cards until we fit
-        while sampled_size > size_threshold and len(sampled) > 1:
+        while sampled_tokens > target_tokens and len(sampled) > 1:
             # Remove the smallest card
             smallest_idx = 0
-            smallest_size = len(sampled[0].get("content", ""))
+            smallest_tokens = count_tokens(
+                f"{sampled[0].get('relpath', '')}\n{sampled[0].get('content', '')}", 
+                "openai", model
+            )
             for i, card in enumerate(sampled[1:], 1):
-                card_size = len(card.get("content", ""))
-                if card_size < smallest_size:
-                    smallest_size = card_size
+                card_text = f"{card.get('relpath', '')}\n{card.get('content', '')}"
+                card_tokens = count_tokens(card_text, "openai", model)
+                if card_tokens < smallest_tokens:
+                    smallest_tokens = card_tokens
                     smallest_idx = i
             
             removed_card = sampled.pop(smallest_idx)
-            sampled_size -= (len(removed_card.get("content", "")) + 
-                           len(removed_card.get("peek_head", "")) + 
-                           len(removed_card.get("peek_tail", "")))
+            removed_text = f"{removed_card.get('relpath', '')}\n{removed_card.get('content', '')}"
+            sampled_tokens -= count_tokens(removed_text, "openai", model)
         
         if self.debug:
-            print(f"      Sampled {len(sampled)} cards from {len(set(c.get('relpath', 'unknown') for c in sampled))} files (final size: {sampled_size:,} chars)")
+            print(f"      Sampled {len(sampled)} cards from {len(set(c.get('relpath', 'unknown') for c in sampled))} files (final tokens: {sampled_tokens:,})")
         
         return sampled
     
     def _load_manifest(self, manifest_dir: Path) -> tuple:
-        """Load manifest and cards"""
+        """Load manifest and cards with full content extraction"""
         
         with open(manifest_dir / "manifest.json") as f:
             manifest = json.load(f)
         
+        repo_path = manifest.get('repo_path')
+        if repo_path:
+            self._repo_root = Path(repo_path)
+        
+        from .cards import extract_card_content
+        
         cards = []
         with open(manifest_dir / "cards.jsonl") as f:
             for line in f:
-                cards.append(json.loads(line))
+                card = json.loads(line)
+                if not card.get('content') and self._repo_root:
+                    card['content'] = extract_card_content(card, self._repo_root)
+                cards.append(card)
         
         return manifest, cards
     
-    def _save_results(self, output_dir: Path, manifest: Dict) -> Dict:
+    def _save_results(self, output_dir: Path, manifest: dict) -> dict:
         """Save all graphs and analysis results"""
         
         output_dir.mkdir(parents=True, exist_ok=True)
