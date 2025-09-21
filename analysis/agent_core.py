@@ -11,6 +11,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from llm.token_tracker import get_token_tracker
+
 try:
     # Pydantic v2 style config
     from pydantic import ConfigDict  # type: ignore
@@ -120,6 +122,8 @@ class AutonomousAgent:
             profile=profile_to_use,
             debug_logger=self.debug_logger
         )
+        # Remember which profile the agent uses for context limit calculations
+        self.agent_profile = profile_to_use
         
         # Initialize strategist model for deep thinking
         try:
@@ -151,6 +155,14 @@ class AutonomousAgent:
             self.project_dir = Path.cwd()
         hypothesis_path = project_dir / "hypotheses.json"
         self.hypothesis_store = HypothesisStore(hypothesis_path, agent_id=agent_id)
+
+        # Initialize per-project coverage index for persistent coverage tracking
+        try:
+            from .coverage_index import CoverageIndex
+            self.coverage_index = CoverageIndex(project_dir / 'coverage_index.json', agent_id=agent_id)
+        except Exception:
+            # Keep attribute for conditional checks even if init fails
+            self.coverage_index = None
         
         # Agent's memory - what it has loaded and discovered
         self.loaded_data = {
@@ -414,6 +426,18 @@ class AutonomousAgent:
                     except Exception:
                         pass
                 
+                # Emit context usage after each decision
+                try:
+                    if progress_callback:
+                        usage_msg = self._format_context_usage()
+                        progress_callback({
+                            'status': 'usage',
+                            'iteration': iterations,
+                            'message': usage_msg
+                        })
+                except Exception:
+                    pass
+                
                 # Log the decision
                 self.conversation_history.append({
                     'role': 'assistant',
@@ -429,34 +453,42 @@ class AutonomousAgent:
                 
                 # Execute the decision
                 result = self._execute_action(decision)
-                # Surface result to UI (generic)
+                # Surface result to UI (generic) with defensive guards
                 if progress_callback:
                     try:
+                        safe = result if isinstance(result, dict) else {'status': 'error', 'error': 'No result'}
+                        msg = None
+                        try:
+                            msg = safe.get('summary') or f"{decision.action} -> {safe.get('status', 'done')}"
+                        except Exception:
+                            msg = f"{decision.action} -> done"
                         progress_callback({
                             'status': 'result',
                             'iteration': iterations,
                             'action': decision.action,
-                            'result': result,
-                            'message': result.get('summary') or f"{decision.action} -> {result.get('status', 'done')}"
+                            'result': safe,
+                            'message': msg
                         })
                     except Exception:
                         pass
                 
                 # Log the result - use formatted display for readability
+                # Defensive: coerce result to dict for safe access
+                safe_result = result if isinstance(result, dict) else {}
                 # For successful graph/node loads, show the formatted display
-                if result.get('status') == 'success':
+                if safe_result.get('status') == 'success':
                     if 'graph_display' in result:
                         # load_graph action - show formatted graph
-                        content = f"SUCCESS: {result.get('summary', '')}\n{result['graph_display']}"
+                        content = f"SUCCESS: {safe_result.get('summary', '')}\n{result['graph_display']}"
                     elif 'nodes_display' in result:
                         # load_nodes action - show formatted nodes with code
-                        content = f"SUCCESS: {result.get('summary', '')}\n{result['nodes_display']}"
+                        content = f"SUCCESS: {safe_result.get('summary', '')}\n{result['nodes_display']}"
                     else:
                         # Other successful actions - show as JSON but more readable
-                        content = json.dumps(result, indent=2)
+                        content = json.dumps(safe_result, indent=2)
                 else:
                     # Errors and other statuses - show as JSON
-                    content = json.dumps(result, indent=2)
+                    content = json.dumps(safe_result or {'status': 'unknown'}, indent=2)
                 
                 self.conversation_history.append({
                     'role': 'system',
@@ -472,11 +504,23 @@ class AutonomousAgent:
                 self.action_log.append({
                     'action': decision.action,
                     'params': params_obj,
-                    'result': result.get('summary') or result.get('status') or 'ok'
+                    'result': safe_result.get('summary') or safe_result.get('status') or 'ok'
                 })
 
                 # Maybe compress history if near budget
                 self._maybe_compress_history()
+                
+                # Emit context usage after applying result and any compression
+                try:
+                    if progress_callback:
+                        usage_msg = self._format_context_usage()
+                        progress_callback({
+                            'status': 'usage',
+                            'iteration': iterations,
+                            'message': usage_msg
+                        })
+                except Exception:
+                    pass
                 
                 # Check if complete
                 if decision.action == 'complete':
@@ -502,19 +546,19 @@ class AutonomousAgent:
                     break
                 
                 # Update progress based on action
-                if decision.action == 'form_hypothesis' and result.get('status') == 'success':
+                if decision.action == 'form_hypothesis' and safe_result.get('status') == 'success':
                     if progress_callback:
                         progress_callback({
                             'status': 'hypothesis_formed',
                             'iteration': iterations,
                             'message': f"Formed hypothesis: {decision.parameters.get('description', 'Unknown')}"
                         })
-                elif decision.action == 'load_nodes' and result.get('status') == 'success':
+                elif decision.action == 'load_nodes' and safe_result.get('status') == 'success':
                     if progress_callback:
                         progress_callback({
                             'status': 'code_loaded',
                             'iteration': iterations,
-                            'message': result.get('summary', 'Loaded nodes')
+                            'message': safe_result.get('summary', 'Loaded nodes')
                         })
                         
             except Exception as e:
@@ -539,118 +583,61 @@ class AutonomousAgent:
         return self._generate_report(iterations)
     
     def _format_graph_for_display(self, graph_data: dict, graph_name: str) -> list[str]:
-        """Format a graph for compact display with observations/assumptions."""
-        lines = []
-        lines.append(f"\n--- Graph: {graph_name} ---")
-        
-        nodes = graph_data.get('nodes', [])
-        edges = graph_data.get('edges', [])
-        lines.append(f"Total: {len(nodes)} nodes, {len(edges)} edges")
-        lines.append("USE EXACT NODE IDS AS SHOWN BELOW - NO VARIATIONS!\n")
-        
-        # Show ALL nodes with top observations/assumptions
-        if nodes:
-            lines.append("AVAILABLE NODES (use these EXACT IDs with load_nodes):")
-            lines.append("📊 Code size indicator: [S]=small (1-2 cards), [M]=medium (3-5), [L]=large (6+)")
-            lines.append("PRIORITIZE [S] and [M] nodes! Only load [L] if absolutely necessary!\n")
-            
-            for node in nodes:
-                node_id = node.get('id', 'unknown')
-                node_label = node.get('label', node_id)
-                node_type = node.get('type', 'unknown')
-                
-                # Count source_refs to estimate code size
-                source_refs = node.get('source_refs', []) or []
-                card_count = len(source_refs)
-                
-                # Size indicator
-                if card_count == 0:
-                    size_indicator = "[∅]"  # No code
-                elif card_count <= 2:
-                    size_indicator = "[S]"  # Small
-                elif card_count <= 5:
-                    size_indicator = "[M]"  # Medium
+        """Compact representation of the FULL graph (nodes, edges, top annotations).
+
+        - Shows ALL nodes and ALL edges
+        - Node line: id|type|label|obs:a;b|asm:c;d (obs/asm optional, truncated)
+        - Edge line: src->dst:type|obs:a;b|asm:c   (obs/asm optional, truncated)
+        - Keeps lines short by limiting count and length of annotations
+        """
+        def _short_list(items, max_items=2, max_len=24):
+            out = []
+            for it in items[:max_items]:
+                s = ''
+                if isinstance(it, dict):
+                    s = str(it.get('description') or it.get('content') or it)
                 else:
-                    size_indicator = f"[L:{card_count}]"  # Large with count
-                
-                # Make node IDs stand out more
-                lines.append(f"  {size_indicator} [{node_id}] → {node_label} ({node_type})")
-                
-                # Show annotations inline for maximum compactness
-                observations = node.get('observations', [])
-                assumptions = node.get('assumptions', [])
-                
-                # Collect annotation strings
-                annots = []
-                if observations:
-                    sorted_obs = sorted(observations, 
-                                      key=lambda x: x.get('confidence', 1.0) if isinstance(x, dict) else 1.0, 
-                                      reverse=True)[:2]  # Reduced to 2 for compactness
-                    obs_strs = []
-                    for obs in sorted_obs:
-                        if isinstance(obs, dict):
-                            desc = obs.get('description', obs.get('content', str(obs)))
-                            obs_strs.append(desc)
-                        else:
-                            obs_strs.append(str(obs))
-                    if obs_strs:
-                        annots.append(f"obs:{'; '.join(obs_strs)}")
-                
-                if assumptions:
-                    sorted_assum = sorted(assumptions,
-                                        key=lambda x: x.get('confidence', 0.5) if isinstance(x, dict) else 0.5,
-                                        reverse=True)[:2]  # Reduced to 2 for compactness
-                    assum_strs = []
-                    for assum in sorted_assum:
-                        if isinstance(assum, dict):
-                            desc = assum.get('description', assum.get('content', str(assum)))
-                            assum_strs.append(desc)
-                        else:
-                            assum_strs.append(str(assum))
-                    if assum_strs:
-                        annots.append(f"asm:{'; '.join(assum_strs)}")
-                
-                # Add annotations inline if present
-                if annots:
-                    lines.append(f"    [{' | '.join(annots)}]")
-        
-        # Show edge summary
+                    s = str(it)
+                s = s.replace('\n', ' ').strip()
+                if len(s) > max_len:
+                    s = s[:max_len-1] + '…'
+                if s:
+                    out.append(s)
+            return out
+
+        lines: list[str] = []
+        lines.append(f"\n--- Graph: {graph_name} ---")
+        nodes = graph_data.get('nodes', []) or []
+        edges = graph_data.get('edges', []) or []
+        lines.append(f"Total: {len(nodes)} nodes, {len(edges)} edges")
+        if nodes:
+            lines.append("NODES (id|type|label[|obs:…][|asm:…]):")
+            for n in nodes:
+                nid = n.get('id', 'unknown')
+                ntype = n.get('type', '')
+                nlabel = n.get('label', '')
+                line = f"  {nid}|{ntype}|{nlabel}"
+                obs = _short_list(n.get('observations', []) or [], max_items=2, max_len=28)
+                if obs:
+                    line += f"|obs:{';'.join(obs)}"
+                asm = _short_list(n.get('assumptions', []) or [], max_items=2, max_len=28)
+                if asm:
+                    line += f"|asm:{';'.join(asm)}"
+                lines.append(line)
         if edges:
-            lines.append("\nEDGE TYPES:")
-            edge_types = {}
-            for edge in edges:
-                edge_type = edge.get('type', 'unknown')
-                edge_types[edge_type] = edge_types.get(edge_type, 0) + 1
-            for edge_type, count in edge_types.items():
-                lines.append(f"  • {edge_type}: {count} edges")
-            
-            # Show edges in compact form
-            lines.append("\nEDGES (compact):")
-            for edge in edges[:50]:  # Limit to first 50 edges for readability
-                src = edge.get('source_id') or edge.get('source') or edge.get('src')
-                dst = edge.get('target_id') or edge.get('target') or edge.get('dst')
-                etype = edge.get('type', 'rel')
-                # Build edge line with inline annotations
-                edge_line = f"  {etype} {src}->{dst}"
-                
-                # Show edge observations/assumptions inline for compactness
-                edge_obs = edge.get('observations', [])
-                edge_assum = edge.get('assumptions', [])
-                edge_annots = []
-                if edge_obs:
-                    obs_str = '; '.join(str(o) for o in edge_obs[:2])
-                    edge_annots.append(f"obs:{obs_str}")
-                if edge_assum:
-                    assum_str = '; '.join(str(a) for a in edge_assum[:2])
-                    edge_annots.append(f"asm:{assum_str}")
-                
-                if edge_annots:
-                    edge_line += f" [{' | '.join(edge_annots)}]"
-                lines.append(edge_line)
-            
-            if len(edges) > 50:
-                lines.append(f"  ... and {len(edges) - 50} more edges")
-        
+            lines.append("EDGES (src->dst:type[|obs:…][|asm:…]):")
+            for e in edges:
+                src = e.get('source_id') or e.get('source') or e.get('src') or ''
+                dst = e.get('target_id') or e.get('target') or e.get('dst') or ''
+                et = e.get('type', '')
+                line = f"  {src}->{dst}:{et}"
+                eobs = _short_list(e.get('observations', []) or [], max_items=1, max_len=28)
+                if eobs:
+                    line += f"|obs:{';'.join(eobs)}"
+                easm = _short_list(e.get('assumptions', []) or [], max_items=1, max_len=28)
+                if easm:
+                    line += f"|asm:{';'.join(easm)}"
+                lines.append(line)
         return lines
 
     def _build_context(self) -> str:
@@ -718,7 +705,7 @@ class AutonomousAgent:
                 context_parts.append(f"• {note}")
             context_parts.append("")
         
-        # System graph - ALWAYS VISIBLE with ALL NODES
+        # System graph - ALWAYS VISIBLE with ALL NODES/EDGES (compact)
         if self.loaded_data['system_graph']:
             context_parts.append("=== SYSTEM ARCHITECTURE (ALWAYS VISIBLE) ===")
             graph_name = self.loaded_data['system_graph']['name']
@@ -726,6 +713,28 @@ class AutonomousAgent:
             # Use unified formatting function
             context_parts.extend(self._format_graph_for_display(graph_data, graph_name))
         context_parts.append("")
+
+        # Include any additionally loaded graphs in compact full form
+        if self.loaded_data.get('graphs'):
+            for gname, gdata in self.loaded_data['graphs'].items():
+                context_parts.append(f"=== GRAPH LOADED: {gname} ===")
+                context_parts.extend(self._format_graph_for_display(gdata, gname))
+                context_parts.append("")
+
+        # List currently loaded nodes to prevent reloading
+        if self.loaded_data.get('nodes'):
+            context_parts.append("=== LOADED NODES (CACHE — DO NOT RELOAD) ===")
+            node_ids = list(self.loaded_data['nodes'].keys())
+            # Print compact lists in lines of ~10
+            line = []
+            for i, nid in enumerate(node_ids, 1):
+                line.append(nid)
+                if (i % 10) == 0:
+                    context_parts.append('  ' + ','.join(line))
+                    line = []
+            if line:
+                context_parts.append('  ' + ','.join(line))
+            context_parts.append("")
         
         # Actions performed (recent) - summary only since full data is in RECENT ACTIONS
         if self.action_log:
@@ -809,6 +818,38 @@ class AutonomousAgent:
                 return max(1, len(text) // 4)
             except Exception:
                 return 0
+
+    def _context_limit(self) -> int:
+        """Return context token limit for the agent's model profile."""
+        try:
+            cfg = self.config or {}
+            models = cfg.get('models', {}) if isinstance(cfg, dict) else {}
+            prof = getattr(self, 'agent_profile', 'scout')
+            mcfg = models.get(prof, {}) if isinstance(models, dict) else {}
+            # Prefer model-specific max_context; fall back to global context.max_tokens
+            return int(mcfg.get('max_context') or cfg.get('context', {}).get('max_tokens', 256000))
+        except Exception:
+            return 256000
+
+    def _format_context_usage(self) -> str:
+        """Build a concise usage string with context percent and last LLM call usage."""
+        try:
+            limit = self._context_limit()
+            ctx = self._build_context()
+            used = self._count_tokens(ctx)
+            pct = min(100, int((used * 100) / max(1, limit)))
+        except Exception:
+            limit, used, pct = 0, 0, 0
+        # Last LLM call usage (if any)
+        try:
+            last = get_token_tracker().get_last_usage() or {}
+            prov = last.get('provider') or self.llm.provider_name
+            model = last.get('model') or self.llm.model
+            itok = int(last.get('input_tokens') or 0)
+            otok = int(last.get('output_tokens') or 0)
+            return f"Context {used}/{limit} tok ({pct}%) — Last call {prov}:{model} in={itok} out={otok}"
+        except Exception:
+            return f"Context {used}/{limit} tok ({pct}%)"
 
     def _maybe_compress_history(self):
         """Compress older conversation into memory notes when near context limit.
@@ -1025,8 +1066,13 @@ OPERATING CONSTRAINTS (IMPORTANT):
 - Do NOT propose or assume live on-chain probing (e.g., calling initialize on proxies, running fork-based tests, deploying mocks).
 - All actions here are CODE-ONLY: loading/reading nodes, updating observations, and calling deep_think for analysis. Keep guidance and reasoning aligned with this constraint.
 
+DEDUPLICATION (IMPORTANT):
+- Review the section "LOADED NODES (CACHE — DO NOT RELOAD)" in Current Context.
+- Do NOT request nodes that appear there; pick NEW nodes to expand coverage and avoid repeated loads.
+- If a node is already loaded, prefer loading closely-connected nodes instead (callers/callees/storage it reads/writes).
+
 CRITICAL RULES FOR NODE AND GRAPH NAMES:
-- ALWAYS use EXACT node IDs as shown in the graphs (in square brackets like [node_id])
+- ALWAYS use EXACT node IDs as shown in the NODES sections (the token before the first pipe) or listed under LOADED NODES
 - NEVER guess, modify, or create node names
 - NEVER add prefixes like "func_" or "node_" unless they're already there
 - If a node doesn't exist in the graph, DON'T try variations - it doesn't exist!
@@ -1506,28 +1552,30 @@ DO NOT include any text before or after the JSON object."""
             # Debug logging removed
             
             ordered.sort(key=lambda x: (x.get('relpath') or '', x.get('char_start') or 0))
-            for c in ordered:
-                cid = c.get('id')
-                content = self._extract_card_content(c)
-                
-                # Debug logging removed
-                
-                node_cards.append({
-                    'card_id': cid,
-                    'type': c.get('type', 'code'),
-                    'content': content,
-                    'metadata': {
-                        k: c.get(k) for k in (
-                            'relpath','char_start','char_end','line_start','line_end'
-                        ) if k in c
-                    }
-                })
-                # Track card coverage
-                try:
-                    if self.coverage_index and cid:
-                        self.coverage_index.touch_card(str(cid))
-                except Exception:
-                    pass
+            # Reuse cached code blocks for this node if present
+            cached_cards = self.loaded_data.get('nodes', {}).get(chosen_id, {}).get('cards') if isinstance(self.loaded_data.get('nodes'), dict) else None
+            if cached_cards:
+                node_cards = cached_cards
+            else:
+                for c in ordered:
+                    cid = c.get('id')
+                    content = self._extract_card_content(c)
+                    node_cards.append({
+                        'card_id': cid,
+                        'type': c.get('type', 'code'),
+                        'content': content,
+                        'metadata': {
+                            k: c.get(k) for k in (
+                                'relpath','char_start','char_end','line_start','line_end'
+                            ) if k in c
+                        }
+                    })
+                    # Track card coverage
+                    try:
+                        if self.coverage_index and cid:
+                            self.coverage_index.touch_card(str(cid))
+                    except Exception:
+                        pass
 
             # NO FALLBACK - if node has no explicit source_refs, it has no code
             # This prevents loading entire files when agent requests non-existent nodes
@@ -1535,7 +1583,10 @@ DO NOT include any text before or after the JSON object."""
             node_copy = ndata.copy()
             if node_cards:
                 node_copy['cards'] = node_cards
-                self.loaded_data['code'][chosen_id] = '\n\n'.join(c['content'] for c in node_cards)
+                try:
+                    self.loaded_data['code'][chosen_id] = '\n\n'.join((c.get('content') or '') for c in node_cards if isinstance(c, dict))
+                except Exception:
+                    pass
             self.loaded_data['nodes'][chosen_id] = node_copy
             loaded_nodes.append(chosen_id)
             try:
@@ -1573,6 +1624,10 @@ DO NOT include any text before or after the JSON object."""
         else:
             display_lines.append("")
         
+        # Track duplicate code blocks across this request to avoid re-printing
+        printed_card_ids: set[str] = set()
+        dedup_count = 0
+
         for node_id in current_request_nodes:
             node_data = self.loaded_data['nodes'][node_id]
             node_type = node_data.get('type', 'unknown')
@@ -1610,18 +1665,26 @@ DO NOT include any text before or after the JSON object."""
                 display_lines.append(f"  === CODE ({len(node_data['cards'])} blocks) ===")
                 for i, card in enumerate(node_data['cards']):
                     content = card.get('content', '')
+                    card_id = card.get('card_id') or (card.get('metadata') or {}).get('id')
                     if content:
                         card_type = card.get('type', 'code')
                         metadata = card.get('metadata', {})
                         relpath = metadata.get('relpath', 'unknown')
                         line_start = metadata.get('line_start', '?')
                         line_end = metadata.get('line_end', '?')
-                        
-                        display_lines.append(f"  --- Block {i+1} ({card_type}) from {relpath}:{line_start}-{line_end} ---")
-                        # Show FULL content - no truncation
-                        for line in content.split('\n'):
-                            display_lines.append(f"    {line}")
-                        display_lines.append("")  # Empty line between code blocks
+                        if card_id and card_id in printed_card_ids:
+                            dedup_count += 1
+                            display_lines.append(
+                                f"  --- Block {i+1} ({card_type}) from {relpath}:{line_start}-{line_end} — duplicate, omitted (card {card_id}) ---"
+                            )
+                        else:
+                            if card_id:
+                                printed_card_ids.add(card_id)
+                            display_lines.append(f"  --- Block {i+1} ({card_type}) from {relpath}:{line_start}-{line_end} ---")
+                            # Show FULL content - no truncation
+                            for line in content.split('\n'):
+                                display_lines.append(f"    {line}")
+                            display_lines.append("")  # Empty line between code blocks
             
             display_lines.append("")  # Empty line between nodes
         
@@ -1636,6 +1699,8 @@ DO NOT include any text before or after the JSON object."""
                 display_lines.append(f"  ... and {len(node_by_id) - 10} more")
             display_lines.append("\nUse EXACT node IDs as shown above. Do not guess or modify node names!")
         
+        if dedup_count > 0:
+            display_lines.insert(0, f"[dedup] Omitted {dedup_count} duplicate code block(s) already shown in this request.")
         nodes_display = '\n'.join(display_lines)
         
         # Aggregate card IDs across loaded nodes
@@ -1780,10 +1845,22 @@ DO NOT include any text before or after the JSON object."""
                 config=self.config or {}, 
                 debug=self.debug, 
                 session_id=self.session_id,
-                debug_logger=getattr(self, 'debug_logger', None)
+                debug_logger=getattr(self, 'debug_logger', None),
+                mission=getattr(self, 'mission', None)
             )
-            items = strategist.deep_think(context=context) or []
+            # Pass phase if available (from parent runner)
+            phase = getattr(self, 'current_phase', None)
+            if phase == 'Coverage':
+                items = strategist.deep_think(context=context, phase='Coverage') or []
+            elif phase == 'Saliency':
+                items = strategist.deep_think(context=context, phase='Saliency') or []
+            else:
+                # Auto-detect based on context or default
+                items = strategist.deep_think(context=context) or []
             added = 0
+            dedup_skipped = 0
+            dedup_details: list[str] = []
+            other_skipped: list[str] = []
             titles: list[str] = []
             hyp_info: list[dict] = []
             guidance_model_info = None
@@ -1792,6 +1869,11 @@ DO NOT include any text before or after the JSON object."""
                     guidance_model_info = f"{self.guidance_client.provider_name}:{self.guidance_client.model}"
                 except Exception:
                     guidance_model_info = None
+            # Prepare existing hypotheses for LLM-based dedup in batches
+            try:
+                existing_hyps = self.hypothesis_store.list_all()
+            except Exception:
+                existing_hyps = []
             for it in items:
                 params = {
                     'description': it.get('description', 'Hypothesis'),
@@ -1804,9 +1886,66 @@ DO NOT include any text before or after the JSON object."""
                     'graph_name': 'SystemArchitecture',
                     'guidance_model': guidance_model_info,
                 }
-                res = self._form_hypothesis(params)
-                if res.get('status') == 'success':
+                # LLM-assisted deduplication against existing hypotheses in batches of 20
+                try:
+                    from .hypothesis_dedup import check_duplicates_llm
+                    # Build compact candidate for dedup model
+                    new_candidate = {
+                        'id': 'new_candidate',
+                        'title': params.get('description', ''),
+                        'description': params.get('details') or params.get('description', ''),
+                        'vulnerability_type': params.get('vulnerability_type', 'security_issue'),
+                        'node_refs': params.get('node_ids') or [],
+                    }
+                    is_dup = False
+                    found_dup_ids: list[str] | None = None
+                    batch_size = 20
+                    for i in range(0, len(existing_hyps), batch_size):
+                        batch = existing_hyps[i:i+batch_size]
+                        dup_ids = check_duplicates_llm(
+                            cfg=self.config or {},
+                            new_hypothesis=new_candidate,
+                            existing_batch=batch,
+                            debug_logger=getattr(self, 'debug_logger', None),
+                        )
+                        if dup_ids:
+                            is_dup = True
+                            found_dup_ids = list(dup_ids)
+                            break
+                    if is_dup:
+                        dedup_skipped += 1
+                        try:
+                            title = params.get('description', 'Hypothesis')
+                            if found_dup_ids:
+                                dedup_details.append(f"LLM-dedup: {title} (similar to {', '.join(found_dup_ids)})")
+                            else:
+                                dedup_details.append(f"LLM-dedup: {title}")
+                        except Exception:
+                            pass
+                        # Skip forming duplicate
+                        continue
+                except Exception:
+                    # Never fail deep_think on dedup errors
+                    pass
+                # Be defensive: guard against unexpected returns
+                try:
+                    res = self._form_hypothesis(params)
+                except Exception as e:
+                    res = {'status': 'error', 'error': f'hypothesis formation failed: {e}'}
+                if isinstance(res, dict) and res.get('status') == 'success':
                     added += 1
+                    # Append to existing list so subsequent items can see it for dedup
+                    try:
+                        hid = res.get('hypothesis_id') or ''
+                        existing_hyps.append({
+                            'id': hid,
+                            'title': params.get('description', ''),
+                            'description': params.get('details') or params.get('description', ''),
+                            'vulnerability_type': params.get('vulnerability_type', 'security_issue'),
+                            'node_refs': params.get('node_ids') or [],
+                        })
+                    except Exception:
+                        pass
                     try:
                         titles.append(params.get('description', 'Hypothesis'))
                         hyp_info.append({
@@ -1817,12 +1956,42 @@ DO NOT include any text before or after the JSON object."""
                         })
                     except Exception:
                         pass
+                else:
+                    # Record store-level duplicate reasons (or other failures) compactly
+                    try:
+                        summary = (res or {}).get('summary', '') if isinstance(res, dict) else ''
+                        title = params.get('description', 'Hypothesis')
+                        if 'Duplicate title:' in summary or 'Similar to existing:' in summary:
+                            dedup_skipped += 1
+                            dedup_details.append(f"Store-dedup: {title} — {summary.replace('Failed: ', '')}")
+                        else:
+                            # Other error (e.g., formation failed)
+                            err = (res or {}).get('error', '') if isinstance(res, dict) else ''
+                            if summary or err:
+                                other_skipped.append(f"Form-fail: {title} — {(summary or err)[:200]}")
+                    except Exception:
+                        pass
             # Include raw strategist output if available for CLI display
             full_raw = None
             try:
                 full_raw = getattr(strategist, 'last_raw', None)
             except Exception:
                 full_raw = None
+            # Collect skip info from strategist (e.g., no-node-id cases)
+            skipped_no_node_ids: list[str] = []
+            try:
+                _sk = getattr(strategist, 'last_skipped', None) or {}
+                if isinstance(_sk, dict):
+                    skipped_no_node_ids = list(_sk.get('no_node_ids') or [])
+                    skipped_invalid_format = list(_sk.get('invalid_format') or [])
+                    fallback_assigned = list(_sk.get('fallback_node_ids_assigned') or [])
+                else:
+                    skipped_invalid_format = []
+                    fallback_assigned = []
+            except Exception:
+                skipped_no_node_ids = []
+                skipped_invalid_format = []
+                fallback_assigned = []
             # Heuristic guidance extraction for CLI display: pull bullet points after a GUIDANCE header
             guidance_bullets: list[str] = []
             try:
@@ -1853,14 +2022,33 @@ DO NOT include any text before or after the JSON object."""
                     guidance_bullets = guidance_bullets[:5]
             except Exception:
                 guidance_bullets = []
+            # Get store stats
+            store_stats = {}
+            try:
+                all_hyps = self.hypothesis_store.list_all()
+                store_stats = {
+                    'total': len(all_hyps),
+                    'high_severity': sum(1 for h in all_hyps if h.get('severity') == 'high'),
+                    'critical': sum(1 for h in all_hyps if h.get('severity') == 'critical'),
+                }
+            except Exception:
+                pass
+            
             return {
                 'status': 'success',
-                'summary': f'Deep analysis added {added} hypotheses',
+                'summary': f'Deep analysis added {added} hypotheses' + (f", skipped {dedup_skipped} duplicates" if dedup_skipped else ''),
                 'hypotheses_formed': added,
                 'hypothesis_titles': titles,
                 'hypotheses_info': hyp_info,
                 'full_response': full_raw or '',
-                'guidance_bullets': guidance_bullets
+                'guidance_bullets': guidance_bullets,
+                'dedup_skipped': dedup_skipped,
+                'dedup_details': dedup_details,
+                'skipped_no_node_ids': skipped_no_node_ids,
+                'skipped_invalid_format': skipped_invalid_format,
+                'skipped_errors': other_skipped,
+                'fallback_node_ids_assigned': fallback_assigned,
+                'store_stats': store_stats,
             }
         except Exception as e:
             return {'status': 'error', 'error': str(e)}
@@ -1885,15 +2073,19 @@ DO NOT include any text before or after the JSON object."""
     def _form_hypothesis(self, params: dict) -> dict:
         """Form a new hypothesis."""
         from .concurrent_knowledge import Hypothesis
+        from .path_utils import guess_relpaths
         
         # Ensure we have at least one node ID
         node_ids = params.get('node_ids') or []
         if not node_ids:
             return {'status': 'error', 'error': 'Hypothesis must reference at least one node'}
         
-        # Determine which graph this hypothesis relates to
-        graph_name = params.get('graph_name', 
-                               self.loaded_data.get('system_graph', {}).get('name', 'unknown'))
+        # Determine which graph this hypothesis relates to.
+        # Use a safe fallback if system_graph key exists but value is None.
+        graph_name = params.get(
+            'graph_name',
+            (self.loaded_data.get('system_graph') or {}).get('name', 'unknown')
+        )
         
         # Get model information
         model_info = f"{self.llm.provider_name}:{self.llm.model}"
@@ -1920,9 +2112,14 @@ DO NOT include any text before or after the JSON object."""
             visibility=params.get('visibility', getattr(self, 'default_hypothesis_visibility', 'global'))
         )
         
-        # Extract source files from nodes
+        # Extract source files from nodes (robust to missing cards map)
         source_files = set()
         affected_functions = []
+        cards_map = {}
+        try:
+            cards_map = getattr(self, 'cards', {}) or {}
+        except Exception:
+            cards_map = {}
         
         # Look up source files for each node
         for node_id in node_ids:
@@ -1932,8 +2129,8 @@ DO NOT include any text before or after the JSON object."""
                     if node.get('id') == node_id:
                         # Extract source files from source_refs (card IDs)
                         for card_id in node.get('source_refs', []):
-                            if card_id in self.cards:
-                                card = self.cards[card_id]
+                            if card_id in cards_map:
+                                card = cards_map[card_id]
                                 # Cards have 'relpath' not 'file_path'
                                 if 'relpath' in card:
                                     source_files.add(card['relpath'])
@@ -1945,15 +2142,31 @@ DO NOT include any text before or after the JSON object."""
             
             # Also check in loaded graphs
             for graph_data in self.loaded_data.get('graphs', {}).values():
+                if not isinstance(graph_data, dict):
+                    continue
                 for node in graph_data.get('nodes', []):
                     if node.get('id') == node_id:
                         for card_id in node.get('source_refs', []):
-                            if card_id in self.cards:
-                                card = self.cards[card_id]
+                            if card_id in cards_map:
+                                card = cards_map[card_id]
                                 # Cards have 'relpath' not 'file_path'
                                 if 'relpath' in card:
                                     source_files.add(card['relpath'])
         
+        # Heuristically augment with file paths mentioned in strategist text
+        try:
+            extra_texts = [
+                params.get('details') or '',
+                params.get('description') or '',
+                params.get('reasoning') or '',
+            ]
+            guessed = guess_relpaths("\n".join([t for t in extra_texts if t]), self._repo_root)
+            for rel in guessed:
+                source_files.add(rel)
+        except Exception:
+            # Never block hypothesis formation on heuristics
+            pass
+
         # Store graph name and source files in properties (NOT shown to agent)
         hypothesis.properties = {
             'graph_name': graph_name,

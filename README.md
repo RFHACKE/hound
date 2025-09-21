@@ -28,45 +28,23 @@
 
 ## Overview
 
-Hound is a security audit automation pipeline for AI-assisted code review that mirrors how expert auditors think, learn, and collaborate. 
+Hound is a Language-agnostic AI auditor that autonomously builds and refines adaptive knowledge graphs for deep, iterative code reasoning.
 
 ### Key Features
 
-- Graph-driven analysis: adaptive architecture/access control/value-flow graphs with code-grounded annotations
-- Senior/Junior loop: Strategist plans investigations; Scout executes targeted code reads
-- Precise evidence: findings reference exact files, functions, and code spans
-- Sessionized audits: resumable runs with coverage metrics and token usage
-- Provider‑agnostic models: OpenAI, Anthropic, Google, XAI, plus mock for offline
+- Graph-driven analysis – Flexible, agent-designed graphs that can model any aspect of a system (e.g. architecture, access control, value flows, math, etc.)
+- Relational graph views – High-level graphs support cross-aspect reasoning and precise retrieval of the code snippets that back each subsystem investigated.
+- Belief & hypothesis system – Observations, assumptions, and hypotheses evolve with confidence scores, enabling long-horizon reasoning and cumulative audits.
+- Dynamic model switching – Lightweight "scout" models handle exploration; heavyweight "strategist" models provide deep reasoning, mirroring expert workflows while keeping costs efficient.
+- Strategic audit planning - Balances broad code coverage with focused investigation of the most promising aspects, ensuring both depth and efficiency.
 
-### How It Works
-
-Hound’s analysis loop is organized around graphs, beliefs, and focused investigations:
-
-1. **Relational Knowledge Graphs (adaptive, language‑agnostic)**
-   - A model‑driven graph builder constructs and refines interconnected graphs of the system (architecture, access control, value flows, state). It adapts to the target scope and programming language without relying on brittle parsers or CFG generators.
-   - The graph evolves as the audit progresses: nodes accrue observations and assumptions; relationships are added or revised as new code is inspected.
-   - The agent reasons at a high level, then “zooms in” on a subgraph to pull only the precise code slices needed at that moment. Rather than pure embedding search, the graph provides structured context for targeted retrieval and reasoning.
-
-2. **Belief System and Hypotheses**
-   - Instead of one‑shot judgments, Hound maintains beliefs (hypotheses) that evolve as evidence accumulates. Confidence adjusts up or down when new observations support or contradict an assumption.
-   - This lets the agent keep weak but plausible leads “alive” without overcommitting, then promote or prune them as the audit uncovers more code and context.
-   - The result is steadier calibration over longer runs: fewer premature rejections, better recall of subtle issues, and a transparent trail from initial hunch to conclusion.
-
-3. **Precise Code Grounding**
-   - Every graph element and annotation links to exact files, functions, and call sites. Investigations retrieve only the relevant code spans, maintaining attention on concrete implementation details rather than broad semantic similarity.
-
-4. **Adaptive Planning**
-   - Planning reacts to discoveries: finding one issue seeds targeted searches for related classes of bugs (e.g., privilege checks, reentrancy surfaces, value transfer patterns).
-   - Coverage tracking ensures systematic exploration while allowing strategic pivots toward the most promising areas.
-
-The system employs a **senior/junior auditor pattern**: the Scout (junior) actively navigates the codebase and annotates the knowledge graphs as it explores, while the Strategist (senior) handles high‑level planning and vulnerability analysis, directing and refocusing the Scout as needed. This mirrors real audit teams where seniors guide and juniors investigate.
-
-**Codebase size considerations:** While Hound is language-agnostic and can analyze any codebase, it's optimized for small-to-medium sized projects like typical smart contract applications. Large enterprise codebases may exceed context limits and require selective analysis of specific subsystems.
+**Codebase size considerations:** While Hound can analyze any codebase, it's optimized for small-to-medium sized projects like typical smart contract applications. Large enterprise codebases may exceed context limits and require selective analysis of specific subsystems.
 
 ### Links
 
+- [Paper](https://zenodo.org/records/17129271)
 - [Original blog post](https://muellerberndt.medium.com/unleashing-the-hound-how-ai-agents-find-deep-logic-bugs-in-any-codebase-64c2110e3a6f)
-- [Smart contract audit benchmarks datasets and tooling](https://github.com/muellerberndt/scabench)
+- [Smart contract audit benchmarks datasets and tooling](https://github.com/scabench-org/scabench)
 
 ## Installation
 
@@ -76,10 +54,51 @@ pip install -r requirements.txt
 
 ## Configuration
 
-Set up your API keys, e.g.:
+Set up your OpenAI API key and optional base URL:
 
 ```bash
 export OPENAI_API_KEY=your_key_here
+# Optional: override the base URL (defaults to https://api.openai.com)
+export OPENAI_BASE_URL=https://api.openai.com
+```
+
+Using Gemini via Vertex AI (optional):
+
+- Enable Vertex AI mode (instead of AI Studio) and set your GCP project and region.
+- Credentials are taken from ADC (Application Default Credentials) or a service account; GOOGLE_API_KEY is not used in Vertex AI mode.
+
+```bash
+# Enable Vertex AI routing for Gemini
+export GOOGLE_USE_VERTEX_AI=1
+
+# Provide project and region (region examples: us-central1, europe-west1, asia-northeast1, etc.)
+export VERTEX_PROJECT_ID=my-gcp-project
+export VERTEX_LOCATION=us-central1
+# Alternatively (fallbacks also supported):
+# export GOOGLE_CLOUD_PROJECT=my-gcp-project
+# export GOOGLE_CLOUD_REGION=us-central1
+
+# Authenticate (one of the following)
+# 1) Use gcloud ADC (recommended for local dev):
+#    gcloud auth application-default login
+# 2) Or point to a service account key file:
+#    export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+```
+
+When configured, the effective Vertex AI endpoint will be constructed as:
+https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}
+For example:
+https://us-central1-aiplatform.googleapis.com/v1/projects/my-gcp-project/locations/us-central1
+
+Optional: configure via config.yaml instead of env vars:
+
+```yaml
+gemini:
+  api_key_env: GOOGLE_API_KEY
+  vertex_ai:
+    enabled: true
+    project_id: "my-gcp-project"
+    region: "us-central1"
 ```
 
 Copy the example configuration and edit as needed:
@@ -108,7 +127,7 @@ Projects organize your audits and store all analysis data:
 ./hound.py project create myaudit /path/to/code
 
 # List all projects
-./hound.py project list
+./hound.py project ls
 
 # View project details and coverage
 ./hound.py project info myaudit
@@ -116,49 +135,124 @@ Projects organize your audits and store all analysis data:
 
 ### Step 2: Build Knowledge Graphs
 
-Hound analyzes your codebase and builds aspect-oriented knowledge graphs that serve as the foundation for all subsequent analysis:
+Hound analyzes your codebase and builds aspect‑oriented knowledge graphs that serve as the foundation for all subsequent analysis.
+
+Recommended (one‑liner):
 
 ```bash
-# Build graphs (uses scout model by default)
-./hound.py graph build myaudit
-
-# Customize graph types and depth
-./hound.py graph build myaudit --graphs 5 --iterations 3
+# Auto-generate a default set of graphs (up to 5) and refine
+# Strongly recommended: pass a whitelist of files (comma-separated)
+./hound.py graph build myaudit --auto \
+  --files "src/A.sol,src/B.sol,src/utils/Lib.sol"
 
 # View generated graphs
-./hound.py graph list myaudit
+./hound.py graph ls myaudit
 ```
 
-**What happens:** Hound inspects the codebase and creates specialized graphs for different aspects (e.g., access control, value flows, state management). Each graph contains:
-- **Nodes**: Key concepts, functions, and state variables
-- **Edges**: Relationships between components
-- **Annotations**: Observations and assumptions tied to specific code locations
-- **Code cards**: Extracted code snippets linked to graph elements
+Alternative (manual guidance):
 
-These graphs enable Hound to reason about high-level patterns while maintaining precise code grounding.
+```bash
+# 1) Initialize the baseline SystemArchitecture graph
+./hound.py graph build myaudit --init \
+  --files "src/A.sol,src/B.sol,src/utils/Lib.sol"
+
+# 2) Add a specific graph with your own description (exactly one graph)
+./hound.py graph custom myaudit \
+  "Call graph focusing on function call relationships across modules" \
+  --iterations 2 \
+  --files "src/A.sol,src/B.sol,src/utils/Lib.sol"
+
+# (Repeat 'graph custom' for additional targeted graphs as needed)
+```
+
+Operational notes:
+- `--auto` always includes the SystemArchitecture graph as the first graph. You do not need to run `--init` in addition to `--auto`.
+- If `--init` is used and a `SystemArchitecture` graph already exists, initialization is skipped. Use `--auto` to add more graphs, or remove existing graphs first if you want a clean re‑init.
+- When running `--auto` and graphs already exist, Hound asks for confirmation before updating/overwriting graphs (including SystemArchitecture). To clear graphs:
+
+```bash
+./hound.py graph rm myaudit --all                 # remove all graphs
+./hound.py graph rm myaudit --name SystemArchitecture  # remove one graph
+```
+
+- For large repos, you can constrain scope with `--files` (comma‑separated whitelist) alongside either approach.
+
+Whitelists (strongly recommended):
+
+- Always pass a whitelist of input files via `--files`. For the best results, the selected files should fit in the model’s available context window; whitelisting keeps the graph builder focused and avoids token overflows.
+- If you do not pass `--files`, Hound will consider all files in the repository. On large codebases this triggers sampling and may degrade coverage/quality.
+- `--files` expects a comma‑separated list of paths relative to the repo root.
+
+Examples:
+
+```bash
+# Manual (small projects)
+./hound.py graph build myaudit --auto \
+  --files "src/A.sol,src/B.sol,src/utils/Lib.sol"
+
+# Generate a whitelist automatically (recommended for larger projects)
+python whitelist_builder.py \
+  --input /path/to/repo \
+  --limit-loc 20000 \
+  --output whitelists/myaudit
+
+# Use the generated list (newline-separated) as a comma list for --files
+./hound.py graph build myaudit --auto \
+  --files "$(tr '\n' ',' < whitelists/myaudit | sed 's/,$//')"
+```
+
+- Refine existing graphs (resume building):
+
+You can resume/refine an existing graph without creating new ones using `graph refine`. This skips discovery and saves updates incrementally.
+
+```bash
+# Refine a single graph by name (internal or display)
+./hound.py graph refine myaudit SystemArchitecture \
+  --iterations 2 \
+  --files "src/A.sol,src/B.sol,src/utils/Lib.sol"
+
+# Refine all existing graphs
+./hound.py graph refine myaudit --all --iterations 2 \
+  --files "src/A.sol,src/B.sol,src/utils/Lib.sol"
+```
 
 ### Step 3: Run the Audit
 
 The audit phase uses the **senior/junior pattern** with planning and investigation:
 
 ```bash
-# Run a full audit with strategic planning (new session)
-./hound.py agent audit myaudit
+# 1. Sweep all components for shallow bugs, build code understanding
+./hound.py agent audit myaudit --mode sweep
 
-# Set time limit (in minutes)
-./hound.py agent audit myaudit --time-limit 30
+# 2. Intuition-guided search to find complex bugs
+./hound.py agent audit myaudit --mode intuition --time-limit 300
 
 # Start with telemetry (connect the Chatbot UI to steer)
-./hound.py agent audit myaudit --telemetry --time-limit 30
-
-# Enable debug logging (captures all prompts/responses)
-./hound.py agent audit myaudit --debug
+./hound.py agent audit myaudit --mode intuition --time-limit 30 --telemetry 
 
 # Attach to an existing session and continue where you left off
-./hound.py agent audit myaudit --session <session_id>
+./hound.py agent audit myaudit --mode intuition --session <session_id>
 ```
 
 Tip: When started with `--telemetry`, you can connect the Chatbot UI and steer the audit interactively (see Chatbot section above).
+
+**Audit Modes:**
+
+Hound supports two distinct audit modes:
+
+- **Sweep Mode (`--mode sweep`)**: Phase 1 - Systematic component analysis
+  - Performs a broad, systematic analysis of every major component
+  - Examines each contract, module, and class for vulnerabilities
+  - Builds comprehensive graph annotations for later analysis
+  - Terminates when all accessible components have been analyzed
+  - Best for: Initial vulnerability discovery and building code understanding
+
+- **Intuition Mode (`--mode intuition`)**: Phase 2 - Deep, targeted exploration
+  - Uses intuition-guided search to find high-impact vulnerabilities
+  - Prioritizes monetary flows, value transfers, and theft opportunities
+  - Investigates contradictions between assumptions and observations
+  - Focuses on authentication bypasses and state corruption
+  - Best for: Finding complex, cross-component vulnerabilities
 
 **Key parameters:**
 - **--time-limit**: Stop after N minutes (useful for incremental audits)
@@ -166,64 +260,7 @@ Tip: When started with `--telemetry`, you can connect the Chatbot UI and steer t
 - **--session**: Resume a specific session (continues coverage/planning)
 - **--debug**: Save all LLM interactions to `.hound_debug/`
 
-**Audit duration and depth:**
-Hound is designed to deliver increasingly complete results with longer audits. The analyze step can range from:
-- **Quick scan**: 1 hour with fast models (gpt-4o-mini) for initial findings
-- **Standard audit**: 4-8 hours with balanced models for comprehensive coverage
-- **Deep audit**: Multiple days with advanced models (GPT-5) for exhaustive analysis
-
-The quality and duration depend heavily on the models used. Faster models provide quick results but may miss subtle issues, while advanced reasoning models find deeper vulnerabilities but require more time.
-
-**What happens during an audit:**
-
-The audit is a **dynamic, iterative process** with continuous interaction between Strategist and Scout:
-
-1. **Initial Planning** (Strategist)
-   - Reviews all knowledge graphs and annotations
-   - Identifies contradictions between assumptions and observations
-   - Creates a batch of prioritized investigations (default: 5)
-   - Focus areas: access control violations, value transfer risks, state inconsistencies
-
-2. **Investigation Loop** (Scout + Strategist collaboration)
-   
-   For each investigation in the batch:
-   - **Scout explores**: Loads relevant graph nodes, analyzes code
-   - **Scout escalates**: When deep analysis needed, calls Strategist via `deep_think`
-   - **Strategist analyzes**: Reviews Scout's collected context, forms vulnerability hypotheses
-   - **Hypotheses form**: Findings are added to global store
-   - **Coverage updates**: Tracks visited nodes and analyzed code
-
-3. **Adaptive Replanning**
-   
-   After completing a batch:
-   - Strategist reviews new findings and updated coverage
-   - Reorganizes priorities based on discoveries
-   - If vulnerability found, searches for related issues
-   - Plans next batch of investigations
-   - Continues until coverage goals met or no promising leads remain
-
-4. **Session Management**
-   - Unique session ID tracks the entire audit lifecycle
-   - Coverage metrics show exploration progress
-   - All findings accumulate in hypothesis store
-   - Token usage tracked per model and investigation
-
-**Example output:**
-```
-Planning Next Investigations...
-1. [P10] Investigate role management bypass vulnerabilities
-2. [P9] Check for reentrancy in value transfer functions
-3. [P8] Analyze emergency function privilege escalation
-
-Coverage Statistics:
-  Nodes visited: 23/45 (51.1%)
-  Cards analyzed: 12/30 (40.0%)
-
-Hypotheses Status:
-  Total: 15
-  High confidence: 8
-  Confirmed: 3
-```
+Normally, you want to run sweep mode first followed by intuition mode. The quality and duration depend heavily on the models used. Faster models provide quick results but may miss subtle issues, while advanced reasoning models find deeper vulnerabilities but require more time.
 
 ### Step 4: Monitor Progress
 
@@ -235,19 +272,19 @@ Check audit progress and findings at any time during the audit. If you started t
 
 ```bash
 # View current hypotheses (findings)
-./hound.py hypotheses list myaudit
+./hound.py project ls-hypotheses myaudit
 
 # See detailed hypothesis information
-./hound.py hypotheses list myaudit --verbose
+./hound.py project hypotheses myaudit --details
 
-# Filter by confidence level
-./hound.py hypotheses list myaudit --min-confidence 0.8
+# List hypotheses with confidence ratings
+./hound.py project hypotheses myaudit
 
 # Check coverage statistics
 ./hound.py project coverage myaudit
 
 # View session details
-./hound.py project info myaudit
+./hound.py project sessions myaudit --list
 ```
 
 **Understanding hypotheses:** Each hypothesis represents a potential vulnerability with:
@@ -290,14 +327,15 @@ A reasoning model reviews all hypotheses and updates their status based on evide
 ```bash
 # Run finalization with quality review
 ./hound.py finalize myaudit
+# Re-run all pending (including below threshold)
+./hound.py finalize myaudit --include-below-threshold
 
 # Customize confidence threshold
-./hound.py finalize myaudit \
-  --confidence-threshold 0.7 \
-  --model gpt-4o
+./hound.py finalize myaudit -t 0.7 --model gpt-4o
 
 # Include all findings (not just confirmed)
-./hound.py finalize myaudit --include-all
+# (Use on the report command, not finalize)
+./hound.py report myaudit --all
 ```
 
 **What happens during finalization:**
@@ -353,9 +391,6 @@ Produce comprehensive audit reports with all findings and PoCs:
 # Include all hypotheses, not just confirmed
 ./hound.py report myaudit --include-all
 
-# View the generated report
-./hound.py report view myaudit
-
 # Export report to specific location
 ./hound.py report myaudit --output /path/to/report.html
 ```
@@ -384,7 +419,7 @@ Each audit run operates under a session with comprehensive tracking and per-sess
 
 ```bash
 # View session details
-./hound.py project info myaudit
+./hound.py project sessions myaudit <session_id>
 
 # List and inspect sessions
 ./hound.py project sessions myaudit --list
@@ -438,7 +473,7 @@ When you attach to a session, its status is set to `active` while the audit runs
 Hound ships with a lightweight web UI for steering and monitoring a running audit session. It discovers local runs via a simple telemetry registry and streams status/decisions live.
 
 Prerequisites:
-- Set API keys (at least `OPENAI_API_KEY`): `source ../API_KEYS.txt` or export manually
+- Set API keys (at least `OPENAI_API_KEY`, optional `OPENAI_BASE_URL` for custom endpoints): `source ../API_KEYS.txt` or export manually
 - Install Python deps in this submodule: `pip install -r requirements.txt`
 
 1) Start the agent with telemetry enabled
@@ -491,24 +526,20 @@ Troubleshooting
 Hypotheses are the core findings that accumulate across sessions:
 
 ```bash
-# List all hypotheses with confidence scores
-./hound.py hypotheses list myaudit
+# List hypotheses with confidence scores
+./hound.py project hypotheses myaudit
 
 # View with full details
-./hound.py hypotheses list myaudit --verbose
-
-# Filter by status or confidence
-./hound.py hypotheses list myaudit --status confirmed
-./hound.py hypotheses list myaudit --min-confidence 0.8
+./hound.py project hypotheses myaudit --details
 
 # Update hypothesis status
-./hound.py hypotheses update myaudit hyp_12345 --status confirmed
+./hound.py project set-hypothesis-status myaudit hyp_12345 confirmed
 
 # Reset hypotheses (creates backup)
-./hound.py hypotheses reset myaudit
+./hound.py project reset-hypotheses myaudit
 
 # Force reset without confirmation
-./hound.py hypotheses reset myaudit --force
+./hound.py project reset-hypotheses myaudit --force
 ```
 
 Hypothesis statuses:
@@ -528,8 +559,7 @@ Override default models per component:
 # Use different models for each role
 ./hound.py agent audit myaudit \
   --platform openai --model gpt-4o-mini \           # Scout
-  --strategist-platform anthropic --strategist-model claude-3-opus \  # Strategist
-  --finalizer-platform openai --finalizer-model gpt-4o  # Finalizer
+  --strategist-platform anthropic --strategist-model claude-3-opus   # Strategist
 ```
 
 ### Debug Mode
@@ -561,11 +591,3 @@ Monitor audit progress and completeness:
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
-
-## License
-
-Apache 2.0 with additional terms:
-
-You may use Hound however you want, except selling it as an online service or as an appliance - that requires written permission from the author.
-
-- See [LICENSE](LICENSE) for details.

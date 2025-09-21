@@ -190,8 +190,13 @@ class ProjectManager:
         project_dir: Path | None = None
         if name in registry.get("projects", {}):
             proj_info = registry["projects"][name]
-            project_dir = Path(proj_info.get("path", str(self.projects_dir / name)))
-            if not project_dir.exists():
+            candidate = Path(proj_info.get("path", str(self.projects_dir / name)))
+            # Sanity check: guard against corrupted/mismatched registry entries that
+            # point to a different project directory (e.g., basename mismatch).
+            if candidate.exists() and candidate.name == name:
+                project_dir = candidate
+            else:
+                # Treat as missing so we can fall back to filesystem inference
                 project_dir = None
 
         # Fallback: infer from filesystem if registry entry missing or invalid
@@ -364,7 +369,7 @@ def create(name: str, source_path: str, description: str | None, auto_name: bool
                 cli_cmd = f"python {cli_cmd}"
         
         console.print("\n[cyan]To analyze this project, run:[/cyan]")
-        console.print(f"  {cli_cmd} graph build --project {config['name']}")
+        console.print(f"  {cli_cmd} graph build --project {config['name']} --auto")
         console.print(f"  {cli_cmd} agent audit --project {config['name']}")
         
     except ValueError as e:

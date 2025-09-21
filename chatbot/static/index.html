@@ -16,13 +16,12 @@
     <main class="grid">
       <section class="left">
         <div class="avatar">
-          <img id="avatarImg" src="/static/avatars/neutral.png" alt="portrait" />
-          <div id="statePill" class="pill">Idle</div>
+          <img id="avatarImg" src="/static/inuzumi/Inuzumi-happy.jpg" alt="Inuzumi" />
         </div>
         <div class="controls">
           <button id="connectBtn">Connect</button>
           <button id="micBtn" disabled>Enable Mic</button>
-          <button id="pttBtn" disabled>Push‑to‑Talk</button>
+          <button id="pttBtn" disabled hidden title="Legacy push‑to‑talk (auto‑turn enabled)">Push‑to‑Talk</button>
           <span id="pttStatus" class="hint" hidden>Sent</span>
         </div>
       </section>
@@ -56,6 +55,7 @@
       <div id="activity" class="activity tabpane"></div>
       <div id="planView" class="plan tabpane hidden"></div>
       <div id="hypoView" class="hypo tabpane hidden"></div>
+      <div id="hypoDetail" class="hypo-detail hidden" aria-live="polite"></div>
       <form id="steerForm" class="steerrow">
         <input id="steerInput" placeholder="Steer the audit (e.g., ‘Investigate reentrancy in withdraw’)" />
         <button type="submit">Send</button>

@@ -17,13 +17,54 @@ from rich.table import Table
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pydantic import BaseModel, Field
 
 from analysis.scout import Scout
 from analysis.session_tracker import SessionTracker
 from analysis.strategist import Strategist
 from llm.token_tracker import get_token_tracker
-from llm.unified_client import UnifiedLLMClient
+
+
+def _format_model_sig(models_cfg: dict, key: str, fallbacks: list[str] | None = None) -> str:
+    """Return provider/model for a model profile key or its fallbacks."""
+    fallbacks = fallbacks or []
+    if key in models_cfg:
+        mc = models_cfg.get(key) or {}
+        return f"{mc.get('provider','unknown')}/{mc.get('model','unknown')}"
+    for alt in fallbacks:
+        if alt in models_cfg:
+            mc = models_cfg.get(alt) or {}
+            return f"{mc.get('provider','unknown')}/{mc.get('model','unknown')}"
+    return "unknown/unknown"
+
+
+def _validate_required_models(config: dict | None, console: Console) -> bool:
+    """Ensure required models are configured: scout, strategist, lightweight.
+
+    Prints a concise error and guidance when anything is missing.
+    """
+    if not config or 'models' not in config or not isinstance(config['models'], dict):
+        console.print("[red]Error:[/red] No model configuration found. Edit hound/config.yaml and set models.scout, models.strategist, and models.lightweight.")
+        return False
+    models = config['models']
+    missing: list[str] = []
+    for key in ('scout', 'strategist', 'lightweight'):
+        if key not in models or not isinstance(models[key], dict) or not models[key].get('model'):
+            missing.append(key)
+    if missing:
+        console.print("[red]Missing required model configuration:[/red] " + ", ".join(missing))
+        # Show current configured models for quick debugging
+        try:
+            scout_sig = _format_model_sig(models, 'scout', fallbacks=['agent'])
+            strat_sig = _format_model_sig(models, 'strategist', fallbacks=['guidance'])
+            lite_sig = _format_model_sig(models, 'lightweight', fallbacks=[])
+            console.print(f"Configured → Scout: [magenta]{scout_sig}[/magenta], Strategist: [cyan]{strat_sig}[/cyan], Lightweight: [green]{lite_sig}[/green]")
+        except Exception:
+            pass
+        console.print("Edit [bold]hound/config.yaml[/bold] under 'models' to define these profiles.")
+        console.print("- scout: provider + model (exploration)\n- strategist: provider + model (deep analysis)\n- lightweight: provider + model (utilities like dedup)")
+        console.print("You can override scout with --platform/--model and strategist with --strategist-platform/--strategist-model.")
+        return False
+    return True
 
 
 def get_project_dir(project_id: str) -> Path:
@@ -71,6 +112,10 @@ def run_investigation(project_path: str, prompt: str, iterations: int | None = N
             config['models']['agent']['model'] = model
             console.print(f"[cyan]Overriding agent model: {model}[/cyan]")
     
+    # Validate required models early
+    if not _validate_required_models(config, console):
+        return
+
     # Resolve project path
     if '/' in project_path or Path(project_path).exists():
         project_dir = Path(project_path).resolve()
@@ -101,6 +146,18 @@ def run_investigation(project_path: str, prompt: str, iterations: int | None = N
     
     # Initialize agent
     console.print("[bright_cyan]Initializing agent...[/bright_cyan]")
+    # Show model triplet
+    try:
+        models_cfg = (config or {}).get('models', {})
+        scout_sig = _format_model_sig(models_cfg, 'scout', fallbacks=['agent'])
+        strat_sig = _format_model_sig(models_cfg, 'strategist', fallbacks=['guidance'])
+        lite_sig = _format_model_sig(models_cfg, 'lightweight', fallbacks=[])
+        console.print(Panel.fit(
+            f"Scout: [magenta]{scout_sig}[/magenta]\nStrategist: [cyan]{strat_sig}[/cyan]\nLightweight: [green]{lite_sig}[/green]",
+            border_style="cyan"
+        ))
+    except Exception:
+        pass
     from random import choice as _choice
     console.print(_choice([
         "[white]Normal people ask questions, but YOU issue royal decrees to logic itself.[/white]",
@@ -123,7 +180,6 @@ def run_investigation(project_path: str, prompt: str, iterations: int | None = N
     from rich.live import Live
 
     # Create a live display with rolling event log
-    from rich.panel import Panel
     
     event_log = []  # list of strings (renderables)
     
@@ -342,6 +398,9 @@ def format_tool_call(call):
 
 def format_tool_result(result):
     """Format tool execution result."""
+    # Defensive: ensure result is a dict
+    if not isinstance(result, dict):
+        result = {'status': 'error', 'error': 'No result'}
     if result.get('status') == 'success':
         style = "green"
         icon = "✓"
@@ -559,11 +618,12 @@ class AgentRunner:
     def __init__(self, project_id: str, config_path: Path | None = None, 
                  iterations: int | None = None, time_limit_minutes: int | None = None,
                  debug: bool = False, platform: str | None = None, model: str | None = None,
-                 session: str | None = None, new_session: bool = False):
+                 session: str | None = None, new_session: bool = False, mode: str | None = None):
         self.project_id = project_id
         self.config_path = config_path
         self.max_iterations = iterations
         self.time_limit_minutes = time_limit_minutes
+        self.mode = mode  # 'sweep', 'intuition', or None for auto
         self.debug = debug
         self.platform = platform
         self.model = model
@@ -579,6 +639,11 @@ class AgentRunner:
         self._last_applied_steer: str | None = None
         # Track which steering text triggered a forced replan (to avoid repeats)
         self._last_replan_steer: str | None = None
+        # Cache of graph node IDs to avoid re-reading files repeatedly
+        self._known_node_ids_cache: set[str] | None = None
+        self._node_to_graph_map_cache: dict[str, str] | None = None
+        # Track current audit phase (Early/Mid/Late) for display and planning hints
+        self._current_phase: str | None = None
         
     def initialize(self):
         """Initialize the agent."""
@@ -599,30 +664,46 @@ class AgentRunner:
         
         # If knowledge_graphs.json doesn't exist, look for any graph file
         if knowledge_graphs_path.exists():
-            # Use the SystemOverview graph or first available graph
+            # Prefer SystemArchitecture, then SystemOverview, otherwise first available
             with open(knowledge_graphs_path) as f:
                 graphs_meta = json.load(f)
             if graphs_meta.get('graphs'):
                 graphs_dict = graphs_meta['graphs']
-                # Prefer SystemOverview if it exists
-                if 'SystemOverview' in graphs_dict:
+                # Prefer SystemArchitecture first
+                if 'SystemArchitecture' in graphs_dict:
+                    graph_path = Path(graphs_dict['SystemArchitecture'])
+                # Then fallback to SystemOverview
+                elif 'SystemOverview' in graphs_dict:
                     graph_path = Path(graphs_dict['SystemOverview'])
                 else:
                     # Use the first available graph
                     graph_name = list(graphs_dict.keys())[0]
                     graph_path = Path(graphs_dict[graph_name])
+                # Guard against stale absolute paths pointing to another project dir
+                try:
+                    graphs_dir = project_dir / 'graphs'
+                    if graph_path.is_absolute() and graphs_dir.exists():
+                        if graph_path.parent != graphs_dir:
+                            candidate = graphs_dir / graph_path.name
+                            if candidate.exists():
+                                graph_path = candidate
+                except Exception:
+                    pass
                 console.print(f"[green]Using graph: {graph_path.name}[/green]")
             else:
                 console.print("[red]Error:[/red] No graphs found in knowledge_graphs.json")
                 return False
         elif graphs_dir.exists():
-            # Fallback: look for any graph_*.json file, preferably SystemOverview
+            # Fallback: look for any graph_*.json file, preferably SystemArchitecture then SystemOverview
             graph_files = list(graphs_dir.glob("graph_*.json"))
             if graph_files:
-                # Prefer SystemOverview if it exists
-                system_overview = graphs_dir / "graph_SystemOverview.json"
-                if system_overview.exists():
-                    graph_path = system_overview
+                # Prefer SystemArchitecture if it exists
+                system_arch = graphs_dir / "graph_SystemArchitecture.json"
+                if system_arch.exists():
+                    graph_path = system_arch
+                # Then prefer SystemOverview
+                elif (graphs_dir / "graph_SystemOverview.json").exists():
+                    graph_path = graphs_dir / "graph_SystemOverview.json"
                 else:
                     graph_path = graph_files[0]
                 console.print(f"[yellow]Using graph: {graph_path.name}[/yellow]")
@@ -636,6 +717,18 @@ class AgentRunner:
         
         if not graph_path.exists():
             console.print(f"[red]Error:[/red] Graph file not found: {graph_path}")
+            return False
+        
+        # Require SystemArchitecture graph before starting an audit
+        try:
+            sys_graph = graphs_dir / 'graph_SystemArchitecture.json'
+            if not sys_graph.exists():
+                console.print("[red]Error: SystemArchitecture graph not found for this project.[/red]")
+                console.print("[yellow]Run one of:\n  ./hound.py graph build <project> --init --iterations 1\n  ./hound.py graph build <project> --auto --iterations 2[/yellow]")
+                return False
+        except Exception:
+            console.print("[red]Error while checking SystemArchitecture graph.[/red]")
+            console.print("[yellow]Rebuild graphs with '--init' or '--auto'.[/yellow]")
             return False
         
         # Load config properly using the standard method
@@ -665,6 +758,10 @@ class AgentRunner:
         # Remember project_dir for plan storage
         self.project_dir = project_dir
         
+        # Validate required models before creating the agent
+        if not _validate_required_models(self.config, console):
+            return False
+
         # Create agent with knowledge graphs metadata
         self.agent = Scout(
             graphs_metadata_path=knowledge_graphs_path,
@@ -674,6 +771,12 @@ class AgentRunner:
             debug=self.debug,
             session_id=self.session_id
         )
+        # Ensure overarching mission is visible to the agent/strategist
+        try:
+            if getattr(self, 'mission', None):
+                self.agent.mission = self.mission
+        except Exception:
+            pass
 
         # Set debug flag and route per-interaction files to project .debug
         self.agent.debug = self.debug
@@ -727,6 +830,12 @@ class AgentRunner:
                     'created_at': datetime.now().isoformat(),
                     'models': self.config.get('models', {}) if self.config else {},
                 }
+                # Persist mission for visibility
+                try:
+                    if getattr(self, 'mission', None):
+                        state['mission'] = self.mission
+                except Exception:
+                    pass
                 import json as _json
                 state_path.write_text(_json.dumps(state, indent=2))
             except Exception:
@@ -861,8 +970,14 @@ class AgentRunner:
         investigations = session_data.get('investigations', [])
         
         results = []
+        seen_goals = set()  # Track goals to avoid duplicates
+        
         for inv in investigations:
             goal = inv.get('goal', '')
+            if goal in seen_goals:
+                continue
+            seen_goals.add(goal)
+            
             hypotheses = inv.get('hypotheses', {})
             total_hyp = hypotheses.get('total', 0)
             iterations = inv.get('iterations_completed', 0)
@@ -873,8 +988,9 @@ class AgentRunner:
         
         # Also add any completed investigations not yet in session
         for goal in self.completed_investigations:
-            if not any(goal in r for r in results):
+            if goal not in seen_goals:
                 results.append(goal)
+                seen_goals.add(goal)
         
         return results
     
@@ -913,15 +1029,13 @@ class AgentRunner:
         except Exception:
             return {'nodes': {'total': 0, 'visited': 0, 'percent': 0.0}, 'cards': {'total': 0, 'visited': 0, 'percent': 0.0}}
 
-    
     def _graph_summary(self) -> str:
         """Create a comprehensive summary of ALL graphs loaded by the Scout."""
         try:
             parts = []
-            
             # Get all loaded graphs from the agent
             loaded_data = self.agent.loaded_data if self.agent else {}
-            
+
             # Process system graph first
             if loaded_data.get('system_graph'):
                 graph_data = loaded_data['system_graph']
@@ -929,73 +1043,81 @@ class AgentRunner:
                 g = graph_data.get('data', {})
                 nodes = g.get('nodes', [])
                 edges = g.get('edges', [])
-                
                 parts.append(f"\n=== {graph_name.upper()} GRAPH ===")
                 parts.append(f"{len(nodes)} nodes, {len(edges)} edges")
-                
-                # List all nodes compactly with inline annotations
+                # List nodes
                 for n in nodes:
+                    # Filter non-application nodes
+                    try:
+                        nid0 = str(n.get('id','') or '')
+                        lbl0 = str(n.get('label','') or '')
+                        ty0 = str(n.get('type','') or '').lower()
+                        if nid0.startswith('contract_I') or lbl0.startswith('I'):
+                            continue
+                        if 'test' in lbl0.lower() or 'mock' in lbl0.lower():
+                            continue
+                        if any(k in ty0 for k in ('test','mock')):
+                            continue
+                    except Exception:
+                        pass
                     nid = n.get('id', '')
                     lbl = n.get('label') or nid
-                    typ = n.get('type', '')[:4]  # Abbreviate type
+                    typ = n.get('type', '')[:4]
                     observations = n.get('observations', [])
                     assumptions = n.get('assumptions', [])
-                    
-                    # Build compact line
-                    line = f"• {lbl} ({typ})"
-                    
-                    # Add inline annotations
+                    line = f"• [{nid}] {lbl} ({typ})"
                     annotations = []
                     if observations:
-                        obs_str = '; '.join(observations[:3])  # Limit to 3
+                        obs_str = '; '.join(observations[-3:])
                         annotations.append(f"obs:{obs_str}")
                     if assumptions:
-                        assum_str = '; '.join(assumptions[:3])  # Limit to 3
+                        assum_str = '; '.join(assumptions[-3:])
                         annotations.append(f"asm:{assum_str}")
-                    
                     if annotations:
                         line += f" [{' | '.join(annotations)}]"
-                        
                     parts.append(line)
-            
-            # Process additional graphs loaded by the Scout
+
+            # Process additional graphs
             additional_graphs = loaded_data.get('graphs', {})
             for graph_name, graph_data in additional_graphs.items():
                 if not isinstance(graph_data, dict) or 'data' not in graph_data:
                     continue
-                    
                 g = graph_data.get('data', {})
                 nodes = g.get('nodes', [])
                 edges = g.get('edges', [])
-                
                 parts.append(f"\n=== {graph_name.upper()} GRAPH ===")
                 parts.append(f"{len(nodes)} nodes, {len(edges)} edges")
-                
-                # List all nodes compactly with inline annotations
                 for n in nodes:
+                    # Filter non-application nodes
+                    try:
+                        nid0 = str(n.get('id','') or '')
+                        lbl0 = str(n.get('label','') or '')
+                        ty0 = str(n.get('type','') or '').lower()
+                        if nid0.startswith('contract_I') or lbl0.startswith('I'):
+                            continue
+                        if 'test' in lbl0.lower() or 'mock' in lbl0.lower():
+                            continue
+                        if any(k in ty0 for k in ('test','mock')):
+                            continue
+                    except Exception:
+                        pass
                     nid = n.get('id', '')
                     lbl = n.get('label') or nid
-                    typ = n.get('type', '')[:4]  # Abbreviate type
+                    typ = n.get('type', '')[:4]
                     observations = n.get('observations', [])
                     assumptions = n.get('assumptions', [])
-                    
-                    # Build compact line
-                    line = f"• {lbl} ({typ})"
-                    
-                    # Add inline annotations
+                    line = f"• [{nid}] {lbl} ({typ})"
                     annotations = []
                     if observations:
-                        obs_str = '; '.join(observations[:3])  # Limit to 3
+                        obs_str = '; '.join(observations[:3])
                         annotations.append(f"obs:{obs_str}")
                     if assumptions:
-                        assum_str = '; '.join(assumptions[:3])  # Limit to 3
+                        assum_str = '; '.join(assumptions[:3])
                         annotations.append(f"asm:{assum_str}")
-                    
                     if annotations:
                         line += f" [{' | '.join(annotations)}]"
-                        
                     parts.append(line)
-                    
+
             return "\n".join(parts) if parts else "(no graphs available)"
         except Exception as e:
             return f"(error summarizing graphs: {str(e)})"
@@ -1060,11 +1182,83 @@ class AgentRunner:
         if len(prepared) >= n:
             return prepared[:n]
 
+        # Heuristics: identify "high-level" SystemArchitecture nodes (contracts/modules/services/files)
+        def _high_level_nodes(sys_nodes: list[dict], sys_edges: list[dict]) -> list[dict]:
+            try:
+                # Build quick degree map
+                deg: dict[str, int] = {}
+                for e in sys_edges or []:
+                    sid = str(e.get('source_id') or e.get('source') or '')
+                    tid = str(e.get('target_id') or e.get('target') or '')
+                    if sid:
+                        deg[sid] = deg.get(sid, 0) + 1
+                    if tid:
+                        deg[tid] = deg.get(tid, 0) + 1
+            except Exception:
+                deg = {}
+
+            hi_type_keywords = {
+                'contract','component','module','service','subsystem','interface','controller','file','package','system','graph','library'
+            }
+            low_type_keywords = {
+                'function','method','variable','state','field','param','event','modifier','mapping','struct','enum',
+                'rule','configuration','config','setting','property','constraint','check','validation'
+            }
+            low_id_prefixes = ('func_', 'method_', 'state_', 'var_', 'evt_', 'event_', 'mod_', 'mapping_', 'param_',
+                              'rule_', 'config_', 'ConfigurationRule_', 'ValidationRule_', 'Check_')
+
+            def is_low_level(n: dict) -> bool:
+                t = str(n.get('type','') or '').lower()
+                i = str(n.get('id','') or '')
+                lbl = str(n.get('label','') or '')
+                if any(k in t for k in low_type_keywords):
+                    return True
+                # Check if ID starts with any low-level prefix
+                if any(i.startswith(prefix) for prefix in low_id_prefixes):
+                    return True
+                # Also check if ID contains Rule, Config, Check, Validation patterns
+                if any(pattern in i for pattern in ['Rule', 'Config', 'Check', 'Validation']):
+                    return True
+                # Looks like a function signature (foo(...))
+                if '(' in lbl and ')' in lbl and ' ' not in lbl.split('(')[0]:
+                    return True
+                return False
+
+            def is_high_level(n: dict) -> bool:
+                if is_low_level(n):
+                    return False
+                t = str(n.get('type','') or '').lower()
+                i = str(n.get('id','') or '')
+                lbl = str(n.get('label','') or '')
+                # Treat solidity interfaces as low-level targets for coverage planning
+                # Conventionally encoded as contract_I<Name>
+                try:
+                    if i.startswith('contract_I') or lbl.startswith('I'):
+                        return False
+                except Exception:
+                    pass
+                if any(k in t for k in hi_type_keywords):
+                    return True
+                if i.startswith(('contract_', 'module_', 'service_', 'component_')):
+                    return True
+                # File-like labels (e.g., Foo.sol)
+                if any(lbl.endswith(ext) for ext in ('.sol','.rs','.go','.py','.ts','.js','.tsx','.jsx')):
+                    return True
+                # Fallback: nodes with higher connectivity are likely architectural
+                did = str(n.get('id','') or '')
+                if deg.get(did, 0) >= 3:
+                    return True
+                return False
+
+            out = [node for node in (sys_nodes or []) if is_high_level(node)]
+            return out
+
         # 2) Ask Strategist for more to top-up to n
         graphs_summary = self._graph_summary()
         hypotheses_summary = self._get_hypotheses_summary()
         investigation_results = self._get_investigation_results_summary()
         coverage_summary = None
+        cov_stats = None
         if self.session_tracker:
             cov_stats = self.session_tracker.get_coverage_stats()
             coverage_summary = (
@@ -1074,29 +1268,267 @@ class AgentRunner:
                 f"({cov_stats['cards']['percent']:.1f}%)"
             )
             if cov_stats['visited_node_ids']:
-                coverage_summary += f"\nVisited nodes: {', '.join(cov_stats['visited_node_ids'][:10])}"
+                try:
+                    annotated_visited = self._annotate_nodes_with_graph(cov_stats['visited_node_ids'][:10])
+                    coverage_summary += f"\nVisited nodes: {', '.join(annotated_visited)}"
+                except Exception:
+                    coverage_summary += f"\nVisited nodes: {', '.join(cov_stats['visited_node_ids'][:10])}"
                 if len(cov_stats['visited_node_ids']) > 10:
                     coverage_summary += f" ... and {len(cov_stats['visited_node_ids']) - 10} more"
+            # Append a concise list of unvisited node IDs to guide coverage
+            try:
+                unvisited_sample, unvisited_count = self._get_unvisited_nodes_sample(max_n=15)
+                if unvisited_count > 0 and unvisited_sample:
+                    try:
+                        annotated_unvisited = self._annotate_nodes_with_graph(unvisited_sample[:10])
+                        sample_str = ', '.join(annotated_unvisited)
+                    except Exception:
+                        sample_str = ', '.join(unvisited_sample[:10])
+                    coverage_summary += f"\nUnvisited nodes: {unvisited_count} (sample: {sample_str}{'' if len(unvisited_sample) <= 10 else ', ...'})"
+                # Also show unvisited high-level components (contracts/modules/services/files)
+                try:
+                    sys_graph = (self.agent.loaded_data or {}).get('system_graph') or {}
+                    gdata = sys_graph.get('data') or {}
+                    nodes = gdata.get('nodes') or []
+                    edges = gdata.get('edges') or []
+                    comp_nodes = _high_level_nodes(nodes, edges)
+                    visited_ids = set(cov_stats.get('visited_node_ids') or [])
+                    unv_comp = [node for node in comp_nodes if str(node.get('id') or '') not in visited_ids]
+                    if unv_comp:
+                        samp = [f"{(node.get('id') or '')}@SystemArchitecture" for node in unv_comp[:10] if node.get('id')]
+                        coverage_summary += f"\nUnvisited components: {len(unv_comp)} (sample: {', '.join(samp)}{'' if len(unv_comp) <= 10 else ', ...'})"
+                        # Add a structured candidate list to guide planner selection
+                        lines = []
+                        for node in unv_comp[:10]:
+                            nid = str(node.get('id') or '')
+                            lbl = str(node.get('label') or nid)
+                            if nid:
+                                lines.append(f"- {lbl} ({nid})")
+                        if lines:
+                            coverage_summary += "\nCANDIDATE COMPONENTS (unvisited):\n" + "\n".join(lines)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # Determine phase (Coverage/Saliency) from mode flag or coverage
+        def _determine_phase_two(cov: dict | None) -> str:
+            # If mode is explicitly set, use it
+            if self.mode:
+                if self.mode.lower() == 'sweep':
+                    return 'Coverage'
+                elif self.mode.lower() == 'intuition':
+                    return 'Saliency'
+            
+            # Otherwise, use automatic determination based on coverage
+            # Defaults
+            cfg_planner = (self.config or {}).get('planner', {}) if self.config else {}
+            two_cfg = (cfg_planner.get('two_phase') or {}) if isinstance(cfg_planner, dict) else {}
+            start_cfg = (two_cfg.get('phase2_start') or {}) if isinstance(two_cfg, dict) else {}
+            try:
+                nodes_threshold = float(start_cfg.get('coverage_nodes_pct', 0.9)) * 100.0 if start_cfg.get('coverage_nodes_pct') <= 1 else float(start_cfg.get('coverage_nodes_pct'))
+            except Exception:
+                nodes_threshold = 90.0
+            try:
+                nodes_pct = float(((cov or {}).get('nodes') or {}).get('percent') or 0.0)
+            except Exception:
+                nodes_pct = 0.0
+
+            # Compute component coverage on SystemArchitecture (contract/component/module)
+            try:
+                sys_graph = (self.agent.loaded_data or {}).get('system_graph') or {}
+                gdata = sys_graph.get('data') or {}
+                nodes = gdata.get('nodes') or []
+                edges = gdata.get('edges') or []
+                comps = _high_level_nodes(nodes, edges)
+                visited_ids = set((cov_stats or {}).get('visited_node_ids') or []) if 'cov_stats' in locals() else set()
+                visited_comp = [node for node in comps if str(node.get('id') or '') in visited_ids]
+                comp_complete = (len(comps) > 0 and len(visited_comp) >= len(comps))
+            except Exception:
+                comp_complete = False
+
+            if comp_complete or nodes_pct >= nodes_threshold:
+                return 'Saliency'
+            return 'Coverage'
+
+        self._current_phase = _determine_phase_two(cov_stats)
 
         strategist = Strategist(config=self.config, debug=self.debug, session_id=self.session_id)
         need = max(0, n - len(prepared))
-        planned = strategist.plan_next(
-            graphs_summary=graphs_summary,
-            completed=investigation_results,
-            hypotheses_summary=hypotheses_summary,
-            coverage_summary=coverage_summary,
-            n=need if need > 0 else 0
-        ) if need > 0 else []
+        planned: list[dict] = []
+        # Strict coverage pre-planning in Early phase: iterate SystemArchitecture components
+        try:
+            strict_cfg = ((self.config or {}).get('planner', {}) or {}).get('strict_coverage', {})
+            strict_enabled = bool(strict_cfg.get('enabled', True))
+            strict_phase_only = str(strict_cfg.get('phase', 'Coverage'))
+            strict_mode = str(strict_cfg.get('mode', 'guide'))  # 'guide' (default) or 'inject'
+        except Exception:
+            strict_enabled = True
+            strict_phase_only = 'Coverage'
+            strict_mode = 'guide'
+
+        if need > 0 and strict_enabled and strict_mode == 'inject' and (self._current_phase or 'Coverage') == strict_phase_only:
+            try:
+                sys_graph = (self.agent.loaded_data or {}).get('system_graph') or {}
+                gdata = sys_graph.get('data') or {}
+                nodes = gdata.get('nodes') or []
+                edges = gdata.get('edges') or []
+                # Use visited set from coverage stats
+                visited_ids = set((cov_stats or {}).get('visited_node_ids') or []) if 'cov_stats' in locals() else set()
+                comp_nodes = _high_level_nodes(nodes, edges)
+                unvisited = [node for node in comp_nodes if str(node.get('id') or '') not in visited_ids]
+                for nnode in unvisited[:need]:
+                    nid = str(nnode.get('id') or '')
+                    lbl = str(nnode.get('label') or nid)
+                    planned.append({
+                        'goal': f"System component review: {lbl} ({nid})",
+                        'focus_areas': [f"{nid}@SystemArchitecture"],
+                        'priority': 7,
+                        'reasoning': 'Strict coverage: map entrypoints, auth, and value/state flows; annotate nodes; avoid deep dives.',
+                        'category': 'aspect',
+                        'expected_impact': 'medium',
+                    })
+            except Exception:
+                pass
+
+        rem = max(0, need - len(planned))
+        if rem > 0:
+            extra = strategist.plan_next(
+                graphs_summary=graphs_summary,
+                completed=investigation_results,
+                hypotheses_summary=hypotheses_summary,
+                coverage_summary=coverage_summary,
+                n=rem,
+                phase_hint=self._current_phase
+            ) or []
+            # Enforce Coverage-phase constraint: keep only aspect items
+            if (self._current_phase or 'Coverage') == 'Coverage':
+                extra = [d for d in extra if str(d.get('category','aspect')).lower() == 'aspect']
+            planned.extend(extra)
+
+        # Final enforcement: in Coverage, ensure all planned items are aspects; if empty, fallback to component injection
+        if (self._current_phase or 'Coverage') == 'Coverage':
+            planned = [d for d in planned if str(d.get('category','aspect')).lower() == 'aspect']
+            if not planned and strict_enabled and strict_phase_only == 'Coverage':
+                try:
+                    sys_graph = (self.agent.loaded_data or {}).get('system_graph') or {}
+                    gdata = sys_graph.get('data') or {}
+                    nodes = gdata.get('nodes') or []
+                    edges = gdata.get('edges') or []
+                    visited_ids = set((cov_stats or {}).get('visited_node_ids') or []) if 'cov_stats' in locals() else set()
+                    comp_nodes = _high_level_nodes(nodes, edges)
+                    unvisited = [node for node in comp_nodes if str(node.get('id') or '') not in visited_ids]
+                    for nnode in unvisited[:need]:
+                        nid = str(nnode.get('id') or '')
+                        lbl = str(nnode.get('label') or nid)
+                        planned.append({
+                            'goal': f"System component review: {lbl} ({nid})",
+                            'focus_areas': [f"{nid}@SystemArchitecture"],
+                            'priority': 7,
+                            'reasoning': 'Coverage-phase fallback: map entrypoints, auth, and value/state flows; annotate nodes; avoid deep dives.',
+                            'category': 'aspect',
+                            'expected_impact': 'medium',
+                        })
+                except Exception:
+                    pass
+
+        # Normalize Coverage goals to 'Vulnerability analysis of <Component>' when possible
+        if (self._current_phase or 'Coverage') == 'Coverage':
+            try:
+                sys_graph = (self.agent.loaded_data or {}).get('system_graph') or {}
+                gdata = sys_graph.get('data') or {}
+                node_by_id = {str(node.get('id') or ''): str(node.get('label') or node.get('id') or '') for node in (gdata.get('nodes') or [])}
+                def _norm_goal(item):
+                    g = str(item.get('goal') or '')
+                    bad = ('map entrypoint', "map entrypoints", "enumerate", "list ", "inventory", "map constructor")
+                    low = g.lower()
+                    if any(b in low for b in bad):
+                        # Try to derive component from focus_areas
+                        fas = item.get('focus_areas') or []
+                        comp = None
+                        if fas:
+                            first = str(fas[0])
+                            nid = first.split('@')[0].strip()
+                            comp = node_by_id.get(nid) or nid
+                        if comp:
+                            item['goal'] = f"Vulnerability analysis of {comp}"
+                        else:
+                            item['goal'] = "Vulnerability analysis of selected component"
+                for it in planned:
+                    _norm_goal(it)
+            except Exception:
+                pass
 
         if self.session_tracker and planned:
             self.session_tracker.add_planning(planned)
 
         # 3) Add new items, skipping duplicates and already-done/in-progress
+        # Round-level duplicate filter: avoid multiple goals targeting the same focus areas
+        seen_focus_keys: set[tuple[str, ...]] = set()
+        def _is_interface_focus(fas: list[str]) -> bool:
+            try:
+                for fa in fas or []:
+                    node_id = (fa.split('@')[0] if isinstance(fa, str) else '')
+                    if str(node_id).startswith('contract_I'):
+                        return True
+            except Exception:
+                return False
+            return False
+
+        # Normalize goal text to identify duplicates and non-application targets
+        def _normalize_goal_text(text: str) -> str:
+            s = (text or '').lower()
+            # Remove phase prefixes and context suffixes
+            s = s.replace('initial sweep: ', '').replace('system component review: ', '')
+            for token in (' within the ', ' within ', ' (', ')'):
+                s = s.replace(token, ' ')
+            # Normalize common verbs
+            s = s.replace('discover vulnerabilities in ', 'target ').replace('identify bugs in ', 'target ')
+            s = ' '.join(s.split())
+            return s
+
+        def _non_app_goal(text: str) -> bool:
+            t = (text or '')
+            tl = t.lower()
+            if ' interface ' in tl or tl.startswith('interface '):
+                return True
+            # If a capitalized token looks like an interface name e.g., IWhitelist
+            try:
+                import re
+                if re.search(r'\bI[A-Z][A-Za-z0-9_]+', t):
+                    return True
+            except Exception:
+                pass
+            bad_words = ('mock', ' test', 'tests', 'example', 'demo', 'script', 'forge-std', 'openzeppelin', 'vendor')
+            return any(w in tl for w in bad_words)
+
+        seen_focus_keys: set[tuple[str, ...]] = set()
+        seen_goal_keys: set[str] = set()
+
         for d in planned:
             if len(prepared) >= n:
                 break
             frame_id = None
             skip = False
+            # Skip explicit interface-only targets
+            if _is_interface_focus(d.get('focus_areas') or []):
+                continue
+            # Skip duplicate focus sets within this planning round (regardless of goal wording)
+            try:
+                key = tuple(sorted(d.get('focus_areas') or []))
+                if key in seen_focus_keys:
+                    continue
+                seen_focus_keys.add(key)
+            except Exception:
+                pass
+            # Skip non-application targets based on goal text heuristics
+            if _non_app_goal(d.get('goal', '')):
+                continue
+            # Skip near-duplicate goals by normalized text
+            gkey = _normalize_goal_text(d.get('goal', ''))
+            if gkey in seen_goal_keys:
+                continue
+            seen_goal_keys.add(gkey)
             if ps is not None:
                 try:
                     ok, fid = ps.propose(
@@ -1148,96 +1580,60 @@ class AgentRunner:
                 existing_frame_ids.add(frame_id)
         return prepared
 
-        class InvestigationItem(BaseModel):
-            goal: str = Field(description="Investigation goal or question")
-            focus_areas: list[str] = Field(default_factory=list)
-            priority: int = Field(ge=1, le=10, description="1-10, 10 = highest")
-            reasoning: str = Field(default="", description="Rationale for why this is promising")
-            category: str = Field(default="aspect", description="aspect | suspicion")
-            expected_impact: str = Field(default="medium", description="high | medium | low")
+    def _get_unvisited_nodes_sample(self, max_n: int = 15) -> tuple[list[str], int]:
+        """Compute a sample of unvisited node IDs from graphs vs session coverage.
 
-        class InvestigationPlan(BaseModel):
-            investigations: list[InvestigationItem] = Field(
-                default_factory=list,
-                description=f"List of exactly {n} investigation items to plan"
-            )
-
-        llm = UnifiedLLMClient(cfg=self.config, profile="guidance")
-
-        system = (
-            "You are a senior smart-contract security auditor planning an audit roadmap.\n"
-            "Plan the next investigations based on the system architecture graph.\n\n"
-            "GUIDELINES:\n"
-            "- Prefer HIGH-LEVEL aspects to review (e.g., authorization/roles, initialization/ownership, external call surfaces, token supply/minting, signature verification & nonces, oracles, withdrawals/escrow, pausing, upgrade paths).\n"
-            "- Only propose a SPECIFIC vulnerability suspicion if the graph itself strongly suggests it (and explain the evidence).\n"
-            "- Prioritize by expected impact and error-proneness.\n"
-            "- Be concise and neutral in goals for aspects (e.g., 'Review authorization and roles'); avoid speculative claims unless evidence exists.\n\n"
-            f"OUTPUT: Return EXACTLY {n} investigations, sorted by priority. Each item MUST include:\n"
-            "  - goal (concise)\n  - focus_areas\n  - priority (1-10)\n  - expected_impact (high/medium/low)\n  - category ('aspect' or 'suspicion')\n  - reasoning (brief rationale; if 'suspicion', cite the graph evidence).\n"
-            f"IMPORTANT: You MUST provide exactly {n} investigation items, no more, no less."
-        )
-        # Include completed investigations in context
-        completed_str = ""
-        if self.completed_investigations:
-            completed_str = "\n\nAlready Completed Investigations:\n" + "\n".join(
-                f"- {goal}" for goal in self.completed_investigations
-            )
-        
-        user = (
-            "System Graph Summary:\n" + self._graph_summary() +
-            completed_str +
-            f"\n\nPlan the top {n} NEW investigations (avoid repeating completed ones)."
-        )
-
+        Returns (sample_list, total_unvisited_count).
+        """
         try:
-            if self.debug:
-                console.print(f"[dim]Calling LLM with system prompt length: {len(system)}[/dim]")
-                console.print(f"[dim]User prompt length: {len(user)}[/dim]")
-            
-            plan = llm.parse(system=system, user=user, schema=InvestigationPlan)
-            items = list(plan.investigations) if plan and hasattr(plan, 'investigations') else []
-            
-            console.print(f"[cyan]LLM returned {len(items)} investigations[/cyan]")
-            if self.debug and items:
-                for i, item in enumerate(items[:3]):
-                    console.print(f"[dim]  {i+1}. {getattr(item, 'goal', 'No goal')}[/dim]")
-            
-            # Fail if LLM cannot generate enough investigations
-            if len(items) < n:
-                error_msg = f"Failed to generate investigation plan: LLM only returned {len(items)} investigations, requested {n}"
-                console.print(f"[red]ERROR: {error_msg}[/red]")
-                raise RuntimeError(error_msg)
-            # Filter out already completed investigations
-            filtered_items = []
-            for item in items:
-                goal = getattr(item, 'goal', '')
-                # Check if this goal has already been investigated (fuzzy match)
-                is_duplicate = False
-                for completed in self.completed_investigations:
-                    if goal.lower() in completed.lower() or completed.lower() in goal.lower():
-                        is_duplicate = True
-                        break
-                if not is_duplicate:
-                    filtered_items.append(item)
-            
-            # Sort by priority desc, then by goal
-            filtered_items.sort(key=lambda x: (-(getattr(x, 'priority', 0) or 0), getattr(x, 'goal', '')))
-            
-            # If we filtered too many due to duplicates, fail the analysis
-            if len(filtered_items) < n:
-                error_msg = f"Cannot generate enough unique investigations: only {len(filtered_items)} unique investigations available after filtering duplicates (requested {n})"
-                console.print(f"[red]ERROR: {error_msg}[/red]")
-                console.print("[yellow]Consider reviewing fewer investigations or starting a new analysis session.[/yellow]")
-                raise RuntimeError(error_msg)
-            
-            return filtered_items[:n]
-        except Exception as e:
-            console.print(f"[red]Error in investigation planning: {str(e)}[/red]")
-            if self.debug:
-                import traceback
-                console.print(f"[dim]{traceback.format_exc()}[/dim]")
-            # Re-raise the exception to fail the analysis
-            raise
+            # Build known nodes cache if missing
+            if self._known_node_ids_cache is None or self._node_to_graph_map_cache is None:
+                all_nodes: set[str] = set()
+                node_to_graph: dict[str, str] = {}
+                graphs_dir = (self.project_dir or Path.cwd()) / 'graphs'
+                if graphs_dir.exists():
+                    import json as _json
+                    for gfile in graphs_dir.glob('graph_*.json'):
+                        try:
+                            gd = _json.loads(Path(gfile).read_text())
+                            gname = gd.get('internal_name') or gd.get('name') or gfile.stem.replace('graph_', '')
+                            for n in gd.get('nodes', []) or []:
+                                nid = n.get('id')
+                                if nid:
+                                    sid = str(nid)
+                                    all_nodes.add(sid)
+                                    if sid not in node_to_graph:
+                                        node_to_graph[sid] = str(gname)
+                        except Exception:
+                            continue
+                self._known_node_ids_cache = all_nodes
+                self._node_to_graph_map_cache = node_to_graph
+            visited = set()
+            try:
+                stats = self.session_tracker.get_coverage_stats() if self.session_tracker else {}
+                visited = set(stats.get('visited_node_ids') or [])
+            except Exception:
+                visited = set()
+            unvisited = list((self._known_node_ids_cache or set()) - visited)
+            unvisited.sort()  # deterministic
+            return (unvisited[:max_n], len(unvisited))
+        except Exception:
+            return ([], 0)
+
+    def _annotate_nodes_with_graph(self, node_ids: list[str]) -> list[str]:
+        """Return node ids annotated with their graph name as nid@Graph.\n\n        If graph is unknown, use '?' as placeholder.
+        """
+        try:
+            # Ensure mapping cache exists
+            if self._node_to_graph_map_cache is None or self._known_node_ids_cache is None:
+                self._get_unvisited_nodes_sample(0)  # builds caches
+            m = self._node_to_graph_map_cache or {}
+            return [f"{nid}@{m.get(nid, '?')}" for nid in node_ids]
+        except Exception:
+            return list(node_ids)
+
+        # NOTE: A legacy direct-LLM planning block once lived here referencing an undefined 'n'.
+        # It has been removed in favor of the Strategist-based planner in _plan_investigations().
 
     def _render_checklist(self, items: list[object], completed_index: int = -1):
         """Render a simple checklist; items up to completed_index are checked."""
@@ -1252,7 +1648,9 @@ class AgentRunner:
                 meta += f", {imp}"
             if cat:
                 meta += f", {cat}"
-            console.print(f"  {mark} {it.goal}  ({meta})")
+            goal = getattr(it, 'goal', '')
+            # Phase 1 investigations are already properly formatted
+            console.print(f"  {mark} {goal}  ({meta})")
 
     def _log_planning_status(self, items: list[object], current_index: int = -1):
         """Log beautiful planning status and coverage information."""
@@ -1264,14 +1662,24 @@ class AgentRunner:
         console.print("[bold cyan]STRATEGIST PLANNING & AUDIT STATUS[/bold cyan]")
         console.print("="*80)
         
-        # Coverage statistics from session tracker
+        # Compact coverage line
         if self.session_tracker:
             cov = self.session_tracker.get_coverage_stats()
-            console.print("\n[bold yellow]Coverage Statistics:[/bold yellow]")
-            console.print(f"  Nodes visited: {cov['nodes']['visited']}/{cov['nodes']['total']} ([cyan]{cov['nodes']['percent']:.1f}%[/cyan])")
-            console.print(f"  Cards analyzed: {cov['cards']['visited']}/{cov['cards']['total']} ([cyan]{cov['cards']['percent']:.1f}%[/cyan])")
+            try:
+                sample, count = self._get_unvisited_nodes_sample(max_n=5)
+                if count > 0 and sample:
+                    sample = self._annotate_nodes_with_graph(sample)
+            except Exception:
+                sample, count = ([], 0)
+            line = (
+                f"Coverage: Nodes {cov['nodes']['visited']}/{cov['nodes']['total']} ({cov['nodes']['percent']:.1f}%) | "
+                f"Cards {cov['cards']['visited']}/{cov['cards']['total']} ({cov['cards']['percent']:.1f}%)"
+            )
+            if count > 0 and sample:
+                line += f" | Unvisited: {count} (sample: {', '.join(sample)})"
+            console.print("\n" + line)
         else:
-            console.print("\n[bold yellow]Coverage Statistics:[/bold yellow] [dim]Not available[/dim]")
+            console.print("\nCoverage: [dim]Not available[/dim]")
         
         # Hypothesis statistics
         hyp = self._hypothesis_stats()
@@ -1291,6 +1699,7 @@ class AgentRunner:
             table = Table(show_header=True, header_style="bold magenta", box=ROUNDED)
             table.add_column("#", style="dim", width=3)
             table.add_column("Status", width=10)
+            table.add_column("Phase", width=12)
             table.add_column("Goal", overflow="fold")
             table.add_column("Priority", width=8)
             table.add_column("Impact", width=8)
@@ -1306,11 +1715,19 @@ class AgentRunner:
                     status = "[dim]PENDING[/dim]"
                 
                 goal = getattr(it, 'goal', '')
+                category = getattr(it, 'category', '-')
+                # Determine phase from current audit phase only (category is shown separately)
+                current_phase = getattr(self, '_current_phase', None)
+                if current_phase == 'Coverage':
+                    phase_label = "[cyan]1 - Sweep[/cyan]"
+                elif current_phase == 'Saliency':
+                    phase_label = "[magenta]2 - Intuition[/magenta]"
+                else:
+                    phase_label = "[dim]-[/dim]"
                 priority = str(getattr(it, 'priority', '-'))
                 impact = getattr(it, 'expected_impact', '-')
-                category = getattr(it, 'category', '-')
                 
-                table.add_row(num, status, goal, priority, impact, category)
+                table.add_row(num, status, phase_label, goal, priority, impact, category)
             
             console.print(table)
         
@@ -1361,6 +1778,7 @@ class AgentRunner:
         # Get the actual models being used from the agent's LLM clients
         agent_model_info = "unknown/unknown"
         guidance_model_info = "unknown/unknown"
+        lightweight_model_info = _format_model_sig(self.config.get('models', {}), 'lightweight') if self.config else 'unknown/unknown'
         
         # Get Scout model info from the actual LLM client
         if hasattr(self.agent, 'llm') and self.agent.llm:
@@ -1415,11 +1833,23 @@ class AgentRunner:
             f"Project: [yellow]{self.project_id}[/yellow]\n"
             f"Scout: [magenta]{agent_model_info}[/magenta]\n"
             f"Strategist: [cyan]{guidance_model_info}[/cyan]\n"
+            f"Lightweight: [green]{lightweight_model_info}[/green]\n"
             f"Context Limit: [blue]{max_tokens:,} tokens[/blue] (compress at {int(compression_threshold*100)}%)"
         )
         if self.time_limit_minutes:
             config_text += f"\nTime Limit: [red]{self.time_limit_minutes} minutes[/red]"
         console.print(Panel.fit(config_text, border_style="cyan"))
+        # Early compact coverage snapshot
+        try:
+            if self.session_tracker:
+                cov = self.session_tracker.get_coverage_stats()
+                # Show a concise one-liner; no samples here to keep it compact
+                console.print(
+                    f"Coverage: Nodes {cov['nodes']['visited']}/{cov['nodes']['total']} ({cov['nodes']['percent']:.1f}%) | "
+                    f"Cards {cov['cards']['visited']}/{cov['cards']['total']} ({cov['cards']['percent']:.1f}%)"
+                )
+        except Exception:
+            pass
 
         # Enhanced progress callback with beautiful logging
         def progress_cb(info: dict):
@@ -1473,19 +1903,198 @@ class AgentRunner:
                 result = info.get('result', {})
                 
                 if action == 'deep_think':
-                    if result.get('status') == 'success':
-                        console.print("\n[bold green]══════ STRATEGIST ANALYSIS COMPLETE ══════[/bold green]")
+                    # Robustness: handle unexpected result types gracefully
+                    if not isinstance(result, dict):
+                        error_msg = f"Unexpected strategist result type: {type(result).__name__}"
+                        console.print(f"\n[bold red]Strategist Error:[/bold red] {error_msg}")
+                        console.print("[yellow]Continuing with scout exploration...[/yellow]")
+                    elif result.get('status') == 'success':
+                        console.print("\n[bold green]═══ STRATEGIST ANALYSIS COMPLETE ═══[/bold green]")
                         
-                        # Show the strategist's analysis
+                        # Parse and display hypotheses from JSON response
                         full_response = result.get('full_response', '')
-                        if full_response:
-                            from rich.panel import Panel
-                            console.print(Panel(full_response, border_style="green", title="Strategist Output"))
+                        strategist_hypotheses = []
+                        guidance_items = []
                         
-                        # Show hypotheses formed
-                        hypotheses_formed = result.get('hypotheses_formed', 0)
-                        if hypotheses_formed > 0:
-                            console.print(f"[bold green]✓ Added {hypotheses_formed} hypothesis(es) to global store[/bold green]")
+                        if isinstance(full_response, str) and full_response.strip().startswith('{'):
+                            try:
+                                data = json.loads(full_response)
+                                strategist_hypotheses = data.get('hypotheses') or []
+                                guidance_items = data.get('guidance') or []
+                            except Exception:
+                                pass
+                        
+                        # Display hypothesis processing results
+                        if strategist_hypotheses:
+                            from rich.table import Table
+                            
+                            console.print("\n[bold cyan]═══ HYPOTHESIS PROCESSING RESULTS ═══[/bold cyan]")
+                            
+                            # Create a table for hypothesis status
+                            table = Table(show_header=True, header_style="bold magenta", box=None, padding=(0,1))
+                            table.add_column("#", style="dim", width=3)
+                            table.add_column("Title", style="cyan", overflow="fold")
+                            table.add_column("Type", style="yellow")
+                            table.add_column("Severity", style="red")
+                            table.add_column("Confidence", justify="right")
+                            table.add_column("Status", style="bold")
+                            
+                            # Track what happened to each hypothesis
+                            hypotheses_formed = result.get('hypotheses_formed', 0)
+                            hyp_info = result.get('hypotheses_info') or []
+                            dedup_details = result.get('dedup_details') or []
+                            
+                            # Build status map and duplicate-of mapping
+                            added_titles = {h.get('title') for h in hyp_info if h.get('title')}
+                            dedup_map: dict[str, str] = {}
+                            dup_ids_by_title: dict[str, list[str]] = {}
+                            try:
+                                import re as _re
+                                _id_re = _re.compile(r"hyp_[0-9a-f]{12}")
+                            except Exception:
+                                _id_re = None  # type: ignore[assignment]
+                            for detail in dedup_details:
+                                s = str(detail)
+                                if ':' in s:
+                                    title_part = s.split(':', 1)[1].strip()
+                                    # Stop before '(' or '—' separators if present
+                                    for _sep in ('(', '—'):
+                                        if _sep in title_part:
+                                            title_part = title_part.split(_sep)[0].strip()
+                                            break
+                                    if title_part:
+                                        dedup_map[title_part] = s
+                                        # Extract any hyp IDs from detail
+                                        try:
+                                            if _id_re:
+                                                ids = _id_re.findall(s)
+                                                if ids:
+                                                    dup_ids_by_title[title_part] = ids[:3]
+                                        except Exception:
+                                            pass
+                            # Load id->title mapping from hypotheses.json for nicer display
+                            id_to_title: dict[str, str] = {}
+                            try:
+                                from pathlib import Path as _Path
+                                hyp_file = (_Path(self.project_dir) / 'hypotheses.json') if self.project_dir else None
+                                if hyp_file and hyp_file.exists():
+                                    import json as _json2
+                                    with open(hyp_file) as _f:
+                                        _data = _json2.load(_f)
+                                    for _hid, _h in (_data.get('hypotheses') or {}).items():
+                                        # Prefer explicit id field, fallback to key
+                                        _key = _h.get('id') or _hid
+                                        id_to_title[_key] = _h.get('title', '')
+                            except Exception:
+                                id_to_title = {}
+                            
+                            for i, h in enumerate(strategist_hypotheses, 1):
+                                title = h.get('title', 'Unknown')
+                                vuln_type = h.get('type', 'unknown')
+                                severity = h.get('severity', 'medium')
+                                confidence = h.get('confidence', 'medium')
+                                
+                                # Format confidence
+                                try:
+                                    conf_val = float(confidence)
+                                    conf_str = f"{conf_val:.0%}"
+                                except (ValueError, TypeError):
+                                    conf_str = str(confidence)
+                                
+                                # Determine status
+                                if title in added_titles:
+                                    status = "[bold green]✓ ADDED[/bold green]"
+                                elif title in dedup_map:
+                                    # Compose duplicate-of suffix with IDs and titles if available
+                                    dup_suffix = ""
+                                    try:
+                                        ids = dup_ids_by_title.get(title) or []
+                                        if ids:
+                                            parts: list[str] = []
+                                            for _id in ids:
+                                                _t = (id_to_title.get(_id) or '').strip()
+                                                parts.append(f"{_id}{(' [' + _t + ']') if _t else ''}")
+                                            dup_suffix = f" → duplicate of: {', '.join(parts)}"
+                                    except Exception:
+                                        dup_suffix = ""
+                                    status = f"[yellow]⊘ DUPLICATE[/yellow]{dup_suffix}"
+                                else:
+                                    # Check if it was skipped for other reasons
+                                    if not h.get('node_ids'):
+                                        status = "[red]✗ NO NODES[/red]"
+                                    else:
+                                        status = "[yellow]⊘ SKIPPED[/yellow]"
+                                
+                                # Add row to table
+                                table.add_row(
+                                    str(i),
+                                    title[:60] + "..." if len(title) > 60 else title,
+                                    vuln_type[:15],
+                                    severity,
+                                    conf_str,
+                                    status
+                                )
+                            
+                            console.print(table)
+                            
+                            # Summary statistics
+                            console.print("\n[bold]Summary:[/bold]")
+                            console.print(f"  • Total hypotheses from strategist: {len(strategist_hypotheses)}")
+                            console.print(f"  • [green]Successfully added to store: {hypotheses_formed}[/green]")
+                            
+                            dedup_count = result.get('dedup_skipped', 0)
+                            if dedup_count > 0:
+                                console.print(f"  • [yellow]Skipped as duplicates: {dedup_count}[/yellow]")
+                            
+                            no_nodes = result.get('skipped_no_node_ids') or []
+                            if no_nodes:
+                                console.print(f"  • [red]Skipped (no node IDs): {len(no_nodes)}[/red]")
+                            
+                            fallback = result.get('fallback_node_ids_assigned') or []
+                            if fallback:
+                                console.print(f"  • [dim]Assigned fallback nodes: {len(fallback)}[/dim]")
+                            
+                            # Show detailed reasoning for duplicates if any
+                            if dedup_details:
+                                console.print("\n[yellow]Duplicate Detection Details:[/yellow]")
+                                for detail in dedup_details[:3]:
+                                    console.print(f"  • {detail}")
+                        
+                        elif not strategist_hypotheses:
+                            console.print("\n[yellow]ℹ No vulnerabilities identified in this analysis[/yellow]")
+                        
+                        # Show guidance
+                        if guidance_items:
+                            console.print("\n[bold cyan]Strategist Guidance:[/bold cyan]")
+                            for item in guidance_items[:5]:
+                                console.print(f"  → {item}")
+                        # Show format issues (invalid structure) and formation errors
+                        try:
+                            inv = result.get('skipped_invalid_format') or []
+                            parsed_cnt = result.get('parsed_lines')
+                            if isinstance(parsed_cnt, int):
+                                console.print(f"[dim]Parsed candidate hypotheses: {parsed_cnt}[/dim]")
+                            if inv:
+                                console.print(f"[dim]Skipped (invalid format): {len(inv)}[/dim]")
+                                for t in inv[:3]:
+                                    s = str(t)
+                                    if len(s) > 120:
+                                        s = s[:117] + '...'
+                                    console.print(f"  - {s}")
+                        except Exception:
+                            pass
+                        # Show formation errors (parsing/robustness issues)
+                        try:
+                            errs = result.get('skipped_errors') or []
+                            if errs:
+                                console.print(f"[dim]Skipped (formation errors): {len(errs)}[/dim]")
+                                for t in errs[:3]:
+                                    s = str(t)
+                                    if len(s) > 120:
+                                        s = s[:117] + '...'
+                                    console.print(f"  - {s}")
+                        except Exception:
+                            pass
                         console.print()
                     else:
                         # Strategist failed - show the error
@@ -1506,6 +2115,12 @@ class AgentRunner:
             "Perform a focused security audit of this codebase based on the available graphs. "
             "Identify potential vulnerabilities or risky patterns, form hypotheses, and summarize findings."
         )
+        # Ensure overarching mission is visible to the agent/strategist
+        try:
+            if getattr(self, 'mission', None):
+                self.agent.mission = self.mission
+        except Exception:
+            pass
 
         results = []
         planned_round = 0
@@ -1536,6 +2151,10 @@ class AgentRunner:
             if ' across ' in t or t.startswith('across '):
                 return True
             return False
+        # Track consecutive rounds with no new investigations to detect stuck state
+        consecutive_empty_rounds = 0
+        last_round_goals = set()
+        
         while True:
             # Time limit check
             if self.time_limit_minutes:
@@ -1545,6 +2164,45 @@ class AgentRunner:
                     break
 
             planned_round += 1
+            # Announce planning batch and current phase before spinner (print once)
+            try:
+                console.print(f"\n[bold cyan]═══ Planning Batch {planned_round} ═══[/bold cyan]")
+                # Two-phase: Sweep vs Intuition
+                phase = getattr(self, '_current_phase', None)
+                if not phase:
+                    # Check if mode is explicitly set
+                    if self.mode:
+                        if self.mode.lower() == 'sweep':
+                            phase = 'Coverage'
+                        elif self.mode.lower() == 'intuition':
+                            phase = 'Saliency'
+                    elif self.session_tracker:
+                        cov_tmp = self.session_tracker.get_coverage_stats()
+                        nodes_pct = float(((cov_tmp or {}).get('nodes') or {}).get('percent') or 0.0)
+                        phase = 'Coverage' if nodes_pct < 90.0 else 'Saliency'
+                if phase:
+                    if phase == 'Coverage':
+                        console.print("\n[bold yellow]═══ PHASE 1: SWEEP ═══[/bold yellow]")
+                        console.print("[dim]Wide sweep for shallow bugs at medium granularity[/dim]")
+                        console.print("[dim]Approach: Examine each module/class for all security issues.[/dim]")
+                        console.print("[dim]Also captures invariants and assumptions to build the knowledge graph.[/dim]\n")
+                    else:
+                        console.print("\n[bold magenta]═══ PHASE 2: INTUITION ═══[/bold magenta]")
+                        console.print("[dim]This phase uses graph-level reasoning to find complex, high-impact vulnerabilities.[/dim]")
+                        console.print("[dim]Focus: Contradictions, invariant violations, cross-component interactions.[/dim]")
+                        console.print("[dim]Leveraging annotations from Phase 1 to guide targeted investigation.[/dim]\n")
+                # Show compact coverage line pre-planning for context
+                if self.session_tracker:
+                    cov = self.session_tracker.get_coverage_stats()
+                    console.print(
+                        f"Coverage: Nodes {cov['nodes']['visited']}/{cov['nodes']['total']} "
+                        f"({cov['nodes']['percent']:.1f}%) | "
+                        f"Cards {cov['cards']['visited']}/{cov['cards']['total']} "
+                        f"({cov['cards']['percent']:.1f}%)"
+                    )
+            except Exception:
+                pass
+
             # Show an animated status while strategist plans the next batch
             try:
                 with console.status("[cyan]Strategist planning next steps...[/cyan]", spinner="dots", spinner_style="cyan"):
@@ -1552,14 +2210,69 @@ class AgentRunner:
             except Exception:
                 items = self._plan_investigations(max(1, plan_n))
             self._agent_log.append(f"Planning batch {planned_round} (top {plan_n})")
-            # Log planning status at start of batch
-            console.print(f"\n[bold cyan]═══ Planning Batch {planned_round} ═══[/bold cyan]")
+            # Log planning status and show planned items (phase banner already printed)
+            # Show current coverage stats and a sample of unvisited nodes
+            try:
+                if self.session_tracker:
+                    _cov = self.session_tracker.get_coverage_stats()
+                    console.print(
+                        f"Coverage: Nodes {_cov['nodes']['visited']}/{_cov['nodes']['total']} "
+                        f"({_cov['nodes']['percent']:.1f}%) | "
+                        f"Cards {_cov['cards']['visited']}/{_cov['cards']['total']} "
+                        f"({_cov['cards']['percent']:.1f}%)"
+                    )
+                    sample, count = self._get_unvisited_nodes_sample(max_n=10)
+                    if count > 0 and sample:
+                        console.print(f"Unvisited nodes (sample): {', '.join(sample)}")
+            except Exception:
+                pass
             self._log_planning_status(items, current_index=-1)
             
             # If no items, log and stop
             if not items:
                 console.print("[yellow]No further promising investigations suggested — audit complete[/yellow]")
                 break
+            
+            # Check if we're getting the same items repeatedly (stuck in a loop)
+            current_round_goals = set(it.goal for it in items)
+            if current_round_goals == last_round_goals:
+                consecutive_empty_rounds += 1
+                if consecutive_empty_rounds >= 2:
+                    console.print("[yellow]\nDetected planning loop - no new components to analyze[/yellow]")
+                    if self.mode == 'sweep':
+                        console.print("[green]Sweep mode complete![/green]")
+                    else:
+                        console.print("[yellow]Consider switching to intuition mode for deeper analysis[/yellow]")
+                    break
+            else:
+                consecutive_empty_rounds = 0
+                last_round_goals = current_round_goals
+            
+            # In sweep mode, check if we've analyzed all reachable components
+            if self.mode == 'sweep' and planned_round > 1:
+                # Get all completed component names from investigations
+                completed_components = set()
+                for goal in self.completed_investigations:
+                    # Extract component names from goals like "Vulnerability analysis of X"
+                    import re
+                    match = re.search(r'(?:of|for|in)\s+([A-Za-z0-9_]+)', goal)
+                    if match:
+                        completed_components.add(match.group(1).lower())
+                
+                # Check if any new items target components we haven't analyzed
+                has_new_targets = False
+                for it in items:
+                    match = re.search(r'(?:of|for|in)\s+([A-Za-z0-9_]+)', it.goal)
+                    if match:
+                        comp = match.group(1).lower()
+                        if comp not in completed_components:
+                            has_new_targets = True
+                            break
+                
+                if not has_new_targets and len(self.completed_investigations) > 0:
+                    console.print("[yellow]\nAll accessible components have been analyzed[/yellow]")
+                    console.print("[green]Sweep mode complete![/green]")
+                    break
             
             # Log previously completed investigations
             if self.completed_investigations:
@@ -1639,6 +2352,18 @@ class AgentRunner:
                 # Log current investigation with updated coverage
                 console.print(f"\n[bold magenta]═══ Starting Investigation {idx+1}/{len(items)} ═══[/bold magenta]")
                 console.print(f"[bold]Goal:[/bold] {inv.goal}")
+                # Snapshot coverage at the start of the investigation
+                try:
+                    if self.session_tracker:
+                        _cov = self.session_tracker.get_coverage_stats()
+                        console.print(
+                            f"Coverage: Nodes {_cov['nodes']['visited']}/{_cov['nodes']['total']} "
+                            f"({_cov['nodes']['percent']:.1f}%) | "
+                            f"Cards {_cov['cards']['visited']}/{_cov['cards']['total']} "
+                            f"({_cov['cards']['percent']:.1f}%)"
+                        )
+                except Exception:
+                    pass
                 self._log_planning_status(items, current_index=idx)
                 # Mark plan item in_progress if we have a frame_id
                 try:
@@ -1804,33 +2529,148 @@ class AgentRunner:
                             
                             if action == 'deep_think':
                                 # Special formatting for deep_think results
-                                if result.get('status') == 'success':
+                                if not isinstance(result, dict):
+                                    error_msg = f"Unexpected strategist result type: {type(result).__name__}"
+                                    console.print(f"\n[bold red]Strategist Error:[/bold red] {error_msg}")
+                                    console.print("[yellow]Continuing with scout exploration...[/yellow]")
+                                elif result.get('status') == 'success':
                                     console.print("\n[bold green]═══ STRATEGIST ANALYSIS COMPLETE ═══[/bold green]")
-                                    full_response = result.get('full_response', '')
-                                    if full_response:
-                                        console.print(Panel(full_response, border_style="green", title="Strategist Output"))
                                     
-                                    hypotheses_formed = result.get('hypotheses_formed', 0)
-                                    hyp_info = result.get('hypotheses_info') or []
-                                    if hypotheses_formed > 0:
-                                        console.print(f"[bold green]✓ Added {hypotheses_formed} hypothesis(es) to global store[/bold green]")
-                                        if hyp_info:
-                                            console.print("[bold cyan]New hypotheses:[/bold cyan]")
-                                            for h in hyp_info[:5]:
-                                                title = h.get('title','Hypothesis')
-                                                sev = h.get('severity','medium')
-                                                conf = h.get('confidence',0)
-                                                console.print(f"  • {title} [dim](severity={sev}, confidence={conf})[/dim]")
-                                                reason = (h.get('reasoning') or '')
-                                                if reason:
-                                                    console.print(f"    [dim]{(reason[:200] + '...') if len(reason)>200 else reason}[/dim]")
-                                    # Show guidance bullets even if no hypotheses were formed
-                                    gb = result.get('guidance_bullets') or []
-                                    if gb:
-                                        console.print("[bold cyan]Strategist Guidance (next steps):[/bold cyan]")
-                                        for b in gb:
-                                            console.print(f"  • {b}")
-                                # 'skipped' status no longer used (guard removed)
+                                    # Parse and display hypotheses from JSON response
+                                    full_response = result.get('full_response', '')
+                                    strategist_hypotheses = []
+                                    guidance_items = []
+                                    
+                                    if isinstance(full_response, str) and full_response.strip().startswith('{'):
+                                        try:
+                                            data = json.loads(full_response)
+                                            strategist_hypotheses = data.get('hypotheses') or []
+                                            guidance_items = data.get('guidance') or []
+                                        except Exception:
+                                            pass
+                                    
+                                    # Display hypothesis processing results
+                                    if strategist_hypotheses:
+                                        from rich.table import Table
+                                        
+                                        console.print("\n[bold cyan]HYPOTHESIS PROCESSING RESULTS[/bold cyan]")
+                                        
+                                        # Create a table for hypothesis status
+                                        table = Table(show_header=True, header_style="bold magenta", box=None, padding=(0,1))
+                                        table.add_column("#", style="dim", width=3)
+                                        table.add_column("Title", style="cyan", overflow="fold")
+                                        table.add_column("Severity", style="red")
+                                        table.add_column("Status", style="bold")
+                                        
+                                        # Track what happened to each hypothesis
+                                        hypotheses_formed = result.get('hypotheses_formed', 0)
+                                        hyp_info = result.get('hypotheses_info') or []
+                                        dedup_details = result.get('dedup_details') or []
+                                        
+                                        # Build status map and duplicate-of mapping
+                                        added_titles = {h.get('title') for h in hyp_info if h.get('title')}
+                                        dedup_details = result.get('dedup_details') or []
+                                        dedup_map: dict[str, str] = {}
+                                        dup_ids_by_title: dict[str, list[str]] = {}
+                                        try:
+                                            import re as _re
+                                            _id_re2 = _re.compile(r"hyp_[0-9a-f]{12}")
+                                        except Exception:
+                                            _id_re2 = None  # type: ignore[assignment]
+                                        for _detail in dedup_details:
+                                            _s = str(_detail)
+                                            if ':' in _s:
+                                                _title_part = _s.split(':', 1)[1].strip()
+                                                for _sep in ('(', '—'):
+                                                    if _sep in _title_part:
+                                                        _title_part = _title_part.split(_sep)[0].strip()
+                                                        break
+                                                if _title_part:
+                                                    dedup_map[_title_part] = _s
+                                                    try:
+                                                        if _id_re2:
+                                                            _ids = _id_re2.findall(_s)
+                                                            if _ids:
+                                                                dup_ids_by_title[_title_part] = _ids[:3]
+                                                    except Exception:
+                                                        pass
+                                        # Load id->title mapping from hypotheses.json for nicer display
+                                        id_to_title2: dict[str, str] = {}
+                                        try:
+                                            from pathlib import Path as _Path2
+                                            hyp_file2 = (_Path2(self.project_dir) / 'hypotheses.json') if self.project_dir else None
+                                            if hyp_file2 and hyp_file2.exists():
+                                                import json as _json3
+                                                with open(hyp_file2) as _f2:
+                                                    _data2 = _json3.load(_f2)
+                                                for _hid2, _h2 in (_data2.get('hypotheses') or {}).items():
+                                                    _key2 = _h2.get('id') or _hid2
+                                                    id_to_title2[_key2] = _h2.get('title', '')
+                                        except Exception:
+                                            id_to_title2 = {}
+                                        
+                                        for i, h in enumerate(strategist_hypotheses, 1):
+                                            title = h.get('title', 'Unknown')
+                                            severity = h.get('severity', 'medium')
+                                            
+                                            # Determine status
+                                            if title in added_titles:
+                                                status = "[bold green]✓ ADDED[/bold green]"
+                                            else:
+                                                # Check for duplicates and compose duplicate-of suffix
+                                                is_dup = False
+                                                dup_suffix2 = ""
+                                                if title in dedup_map:
+                                                    is_dup = True
+                                                    try:
+                                                        _ids2 = dup_ids_by_title.get(title) or []
+                                                        if _ids2:
+                                                            _parts2: list[str] = []
+                                                            for _id in _ids2:
+                                                                _t2 = (id_to_title2.get(_id) or '').strip()
+                                                                _parts2.append(f"{_id}{(' [' + _t2 + ']') if _t2 else ''}")
+                                                            dup_suffix2 = f" → duplicate of: {', '.join(_parts2)}"
+                                                    except Exception:
+                                                        dup_suffix2 = ""
+                                                    status = f"[yellow]⊘ DUPLICATE[/yellow]{dup_suffix2}"
+                                                if not is_dup:
+                                                    if not h.get('node_ids'):
+                                                        status = "[red]✗ NO NODES[/red]"
+                                                    else:
+                                                        status = "[yellow]⊘ SKIPPED[/yellow]"
+                                            
+                                            # Add row to table
+                                            table.add_row(
+                                                str(i),
+                                                title[:60] + "..." if len(title) > 60 else title,
+                                                severity,
+                                                status
+                                            )
+                                        
+                                        console.print(table)
+                                        
+                                        # Summary with store stats
+                                        console.print(f"\n[bold]Total: {len(strategist_hypotheses)} | [green]Added: {hypotheses_formed}[/green] | [yellow]Skipped: {len(strategist_hypotheses) - hypotheses_formed}[/yellow][/bold]")
+                                        
+                                        # Show hypothesis store stats if available
+                                        try:
+                                            store_stats = result.get('store_stats')
+                                            if not store_stats and hasattr(self, 'agent') and hasattr(self.agent, 'hypothesis_store'):
+                                                all_hyps = self.agent.hypothesis_store.list_all()
+                                                store_stats = {'total': len(all_hyps)}
+                                            if store_stats:
+                                                console.print(f"\n[dim]Hypothesis Store: {store_stats.get('total', 0)} total vulnerabilities tracked[/dim]")
+                                        except Exception:
+                                            pass
+                                    
+                                    elif not strategist_hypotheses:
+                                        console.print("\n[yellow]ℹ No vulnerabilities identified in this analysis[/yellow]")
+                                    
+                                    # Show guidance
+                                    if guidance_items:
+                                        console.print("\n[bold cyan]Strategist Guidance:[/bold cyan]")
+                                        for item in guidance_items[:5]:
+                                            console.print(f"  → {item}")
                                 else:
                                     error_msg = result.get('error', 'Unknown error')
                                     console.print(f"\n[bold red]Strategist Error:[/bold red] {error_msg}")
@@ -1866,6 +2706,9 @@ class AgentRunner:
                             
                             self._agent_log.append(f"Iter {it} result: {action}")
                             
+                        elif status == 'usage':
+                            console.print(f"[dim]Usage: {msg}[/dim]")
+                            self._agent_log.append(f"Iter {it} usage: {msg}")
                         elif status in {'analyzing', 'executing', 'hypothesis_formed'}:
                             console.print(f"[dim]{status.capitalize()}: {msg}[/dim]")
                             self._agent_log.append(f"Iter {it} {status}: {msg[:100]}")
@@ -1873,7 +2716,10 @@ class AgentRunner:
                     # Show an animated status while the agent thinks/acts for this investigation
                     replan_requested = False
                     try:
-                        with console.status("[cyan]Agent thinking deeply...[/cyan]", spinner="line", spinner_style="cyan"):
+                        # Set the current phase on the agent for deep_think
+                        self.agent.current_phase = self._current_phase
+                        # More accurate status: the Scout is exploring code, not just "thinking"
+                        with console.status("[cyan]Exploring codebase and analyzing nodes...[/cyan]", spinner="line", spinner_style="cyan"):
                             report = self.agent.investigate(inv.goal, max_iterations=max_iters, progress_callback=_cb)
                     except _TimeLimitReached:
                         console.print(f"\n[yellow]Time limit reached ({self.time_limit_minutes} minutes) — stopping audit[/yellow]")
@@ -1937,6 +2783,18 @@ class AgentRunner:
                     raise
                 # Show completion
                 console.print(f"\n[bold green]✓ Investigation Completed:[/bold green] {inv.goal}")
+                # Show updated coverage after completion
+                try:
+                    if self.session_tracker:
+                        _cov = self.session_tracker.get_coverage_stats()
+                        console.print(
+                            f"Coverage: Nodes {_cov['nodes']['visited']}/{_cov['nodes']['total']} "
+                            f"({_cov['nodes']['percent']:.1f}%) | "
+                            f"Cards {_cov['cards']['visited']}/{_cov['cards']['total']} "
+                            f"({_cov['cards']['percent']:.1f}%)"
+                        )
+                except Exception:
+                    pass
                 self._agent_log.append(f"✓ Completed: {inv.goal}")
                 # Mark plan item done
                 try:
@@ -1988,7 +2846,10 @@ class AgentRunner:
                 fid = getattr(inv, 'frame_id', '') or ''
                 iters = (rep or {}).get('iterations_completed', 0)
                 hyps = (rep or {}).get('hypotheses', {}).get('total', 0)
-                exec_table.add_row(str(rown), str(fid), getattr(inv, 'goal',''), str(planned_round), str(rown), str(iters), str(hyps))
+                goal = getattr(inv, 'goal', '')
+                # Phase 1 investigations are already properly formatted
+                phase = getattr(self, '_current_phase', None)
+                exec_table.add_row(str(rown), str(fid), goal, str(planned_round), str(rown), str(iters), str(hyps))
             console.print("\n[bold cyan]Plan Execution Summary[/bold cyan]")
             console.print(exec_table)
         except Exception:
@@ -2050,6 +2911,7 @@ class AgentRunner:
 @click.option('--time-limit', type=int, help='Time limit in minutes')
 @click.option('--config', type=click.Path(exists=True), help='Configuration file')
 @click.option('--debug', is_flag=True, help='Enable debug logging of prompts and responses')
+@click.option('--mode', type=click.Choice(['sweep', 'intuition'], case_sensitive=False), default=None, help='Analysis mode: sweep (Phase 1) or intuition (Phase 2)')
 @click.option('--platform', default=None, help='Override scout platform (e.g., openai, anthropic, mock)')
 @click.option('--model', default=None, help='Override scout model (e.g., gpt-5, gpt-4o-mini, mock)')
 @click.option('--strategist-platform', default=None, help='Override strategist platform (e.g., openai, anthropic, mock)')
@@ -2059,19 +2921,25 @@ class AgentRunner:
 @click.option('--session-private-hypotheses', is_flag=True, help='Keep new hypotheses private to this session')
 @click.option('--telemetry', is_flag=True, help='Expose local (localhost) telemetry SSE/control and register instance')
 @click.option('--strategist-two-pass', is_flag=True, help='Enable strategist two-pass self-critique to reduce false positives')
+@click.option('--mission', default=None, help='Overarching mission for the audit (always visible to the Strategist)')
 def agent(project_id: str, iterations: int | None, plan_n: int, time_limit: int | None, 
-          config: str | None, debug: bool, platform: str | None, model: str | None,
+          config: str | None, debug: bool, mode: str | None, platform: str | None, model: str | None,
           strategist_platform: str | None, strategist_model: str | None,
           session: str | None, new_session: bool, session_private_hypotheses: bool,
-          telemetry: bool, strategist_two_pass: bool):
+          telemetry: bool, strategist_two_pass: bool, mission: str | None):
     """Run autonomous security analysis agent."""
     
     config_path = Path(config) if config else None
     
-    runner = AgentRunner(project_id, config_path, iterations, time_limit, debug, platform, model, session=session, new_session=new_session)
+    runner = AgentRunner(project_id, config_path, iterations, time_limit, debug, platform, model, session=session, new_session=new_session, mode=mode)
+    try:
+        runner.mission = mission
+    except Exception:
+        pass
     
     if not runner.initialize():
-        return
+        # Ensure CLI signals failure to callers (e.g., benchmark runner)
+        raise click.Exit(1)
     
     # Optional telemetry: local-only HTTP SSE/control + instance registry
     tele = None
